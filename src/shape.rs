@@ -5,9 +5,9 @@
 
 use crate::fallback::FontFallbackIter;
 use crate::{
-    math, Align, Attrs, AttrsList, CacheKeyFlags, Color, DecorationMetrics, DecorationSpan,
-    Ellipsize, EllipsizeHeightLimit, Family, Font, FontSystem, GlyphDecorationData, Hinting,
-    LayoutGlyph, LayoutLine, Metrics, SpanPadding, Wrap,
+    Align, Attrs, AttrsList, CacheKeyFlags, Color, DecorationMetrics, DecorationSpan, Ellipsize,
+    EllipsizeHeightLimit, Family, Font, FontSystem, GlyphDecorationData, Hinting, LayoutGlyph,
+    LayoutLine, Metrics, SpanPadding, Wrap, math,
 };
 #[cfg(not(feature = "std"))]
 use alloc::{format, vec, vec::Vec};
@@ -299,6 +299,29 @@ fn shape_fallback(
     missing
 }
 
+fn preferred_emoji_font(fonts: &mut FontSystem) -> Option<alloc::sync::Arc<Font>> {
+    #[cfg(target_os = "windows")]
+    const FAMILIES: &[&str] = &["Segoe UI Emoji", "Noto Color Emoji"];
+    #[cfg(target_os = "macos")]
+    const FAMILIES: &[&str] = &["Apple Color Emoji", "Noto Color Emoji"];
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    const FAMILIES: &[&str] = &["Noto Color Emoji", "Twemoji Mozilla", "EmojiOne Color"];
+    for family in FAMILIES {
+        let Some(id) = fonts.db().query(&fontdb::Query {
+            families: &[fontdb::Family::Name(family)],
+            weight: fontdb::Weight::NORMAL,
+            stretch: fontdb::Stretch::Normal,
+            style: fontdb::Style::Normal,
+        }) else {
+            continue;
+        };
+        if let Some(font) = fonts.get_font(id, fontdb::Weight::NORMAL) {
+            return Some(font);
+        }
+    }
+    None
+}
+
 fn shape_run(
     glyphs: &mut Vec<ShapeGlyph>,
     font_system: &mut FontSystem,
@@ -332,6 +355,17 @@ fn shape_run(
 
     log::trace!("      Run {:?}: '{}'", &scripts, &line[start_run..end_run],);
 
+    let run = &line[start_run..end_run];
+    let emoji_font = if !run.is_ascii()
+        && run
+            .graphemes(true)
+            .next()
+            .is_some_and(crate::emoji::emoji_presentation)
+    {
+        preferred_emoji_font(font_system)
+    } else {
+        None
+    };
     let attrs = attrs_list.get_span(start_run);
 
     let fonts = font_system.get_font_matches(&attrs);
@@ -347,7 +381,7 @@ fn shape_run(
         &attrs,
     );
 
-    let font = font_iter.next().expect("no default font found");
+    let font = emoji_font.unwrap_or_else(|| font_iter.next().expect("no default font found"));
 
     let glyph_start = glyphs.len();
     let mut missing = {
@@ -887,22 +921,26 @@ impl ShapeWord {
             // Complex text path: Full grapheme iteration and attribute processing
             let mut start_run = word_range.start;
             let mut attrs = attrs_list.defaults();
-            for (egc_i, _egc) in word.grapheme_indices(true) {
+            let mut emoji = false;
+            for (egc_i, egc) in word.grapheme_indices(true) {
                 let start_egc = word_range.start + egc_i;
                 let attrs_egc = attrs_list.get_span(start_egc);
-                if !attrs.compatible(&attrs_egc) {
-                    shaping.run(
-                        &mut glyphs,
-                        font_system,
-                        line,
-                        attrs_list,
-                        start_run,
-                        start_egc,
-                        span_rtl,
-                    );
-
+                let emoji_egc = crate::emoji::emoji_presentation(egc);
+                if !attrs.compatible(&attrs_egc) || emoji != emoji_egc {
+                    if start_run < start_egc {
+                        shaping.run(
+                            &mut glyphs,
+                            font_system,
+                            line,
+                            attrs_list,
+                            start_run,
+                            start_egc,
+                            span_rtl,
+                        );
+                    }
                     start_run = start_egc;
                     attrs = attrs_egc;
+                    emoji = emoji_egc;
                 }
             }
             if start_run < word_range.end {
