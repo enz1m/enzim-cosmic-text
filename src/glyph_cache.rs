@@ -1,3 +1,4 @@
+// Modified by enzUI contributors. See FORK.md.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 bitflags::bitflags! {
@@ -11,7 +12,30 @@ bitflags::bitflags! {
         const DISABLE_HINTING = 2;
         /// Render as a pixel font
         const PIXEL_FONT = 4;
+        /// Render without antialiasing: every pixel fully on or off
+        /// (enzICED)
+        const MONOCHROME = 8;
     }
+}
+
+/// The flags every new [`CacheKey`] carries (enzICED): the desktop's
+/// hinting and antialiasing choice, as [`CacheKeyFlags::DISABLE_HINTING`]
+/// and [`CacheKeyFlags::MONOCHROME`].
+static RASTER_FLAGS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Sets how glyphs are rasterized from now on: hinted or not, antialiased or
+/// not (enzICED). The choice is part of every new [`CacheKey`], so glyphs
+/// cached under the old one are not reused.
+pub fn set_raster_preferences(hinting: bool, antialias: bool) {
+    let mut flags = CacheKeyFlags::empty();
+    flags.set(CacheKeyFlags::DISABLE_HINTING, !hinting);
+    flags.set(CacheKeyFlags::MONOCHROME, !antialias);
+    RASTER_FLAGS.store(flags.bits(), core::sync::atomic::Ordering::Relaxed);
+}
+
+/// The flags [`set_raster_preferences`] set.
+pub fn raster_flags() -> CacheKeyFlags {
+    CacheKeyFlags::from_bits_truncate(RASTER_FLAGS.load(core::sync::atomic::Ordering::Relaxed))
 }
 
 /// Key for building a glyph cache
@@ -51,7 +75,7 @@ impl CacheKey {
                 font_size_bits: font_size.to_bits(),
                 x_bin,
                 y_bin,
-                flags,
+                flags: flags | raster_flags(),
                 font_weight: weight,
             },
             x,

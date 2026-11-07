@@ -56,7 +56,7 @@ fn swash_image(
     };
 
     // Select our source order
-    Render::new(&[
+    let mut image = Render::new(&[
         // Color outline with the first palette
         Source::ColorOutline(0),
         // Color bitmap with best fit selection mode
@@ -77,7 +77,15 @@ fn swash_image(
         None
     })
     // Render the image
-    .render(&mut scaler, cache_key.glyph_id)
+    .render(&mut scaler, cache_key.glyph_id)?;
+    // enzICED: without antialiasing a coverage mask is thresholded, so every
+    // pixel is fully on or off.
+    if cache_key.flags.contains(CacheKeyFlags::MONOCHROME) && image.content == SwashContent::Mask {
+        for coverage in &mut image.data {
+            *coverage = if *coverage >= 128 { 255 } else { 0 };
+        }
+    }
+    Some(image)
 }
 
 fn swash_outline_commands(

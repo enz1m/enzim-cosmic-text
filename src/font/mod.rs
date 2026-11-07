@@ -1,3 +1,4 @@
+// Modified by enzUI contributors. See FORK.md.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use harfrust::Shaper;
@@ -19,6 +20,12 @@ use fontdb::Style;
 use self_cell::self_cell;
 
 pub mod fallback;
+#[cfg(all(
+    feature = "fontconfig",
+    unix,
+    not(any(target_os = "android", target_os = "macos"))
+))]
+pub mod fontconfig;
 pub use fallback::{Fallback, PlatformFallback};
 
 pub use self::system::*;

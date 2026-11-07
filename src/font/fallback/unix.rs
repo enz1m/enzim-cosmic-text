@@ -1,3 +1,4 @@
+// Modified by enzUI contributors. See FORK.md.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use unicode_script::Script;
@@ -22,6 +23,14 @@ impl Fallback for PlatformFallback {
         script: unicode_script::Script,
         locale: &str,
     ) -> &'static [&'static str] {
+        // enzICED: fontconfig's family for the script's language comes first,
+        // so a desktop without the Noto family still finds a face that shapes.
+        #[cfg(feature = "fontconfig")]
+        if let Some(list) =
+            crate::fontconfig::script_fallback(script, locale, script_fallback(script, locale))
+        {
+            return list;
+        }
         script_fallback(script, locale)
     }
 }
