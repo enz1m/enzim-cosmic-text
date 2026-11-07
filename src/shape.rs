@@ -1912,8 +1912,11 @@ impl ShapeLine {
     ) -> Vec<LayoutLine> {
         let mut lines = Vec::with_capacity(1);
         let mut scratch = ShapeBuffer::default();
+        // Without an ellipsis no height limit is counted, so the line height
+        // is not read.
         self.layout_to_buffer(
             &mut scratch,
+            font_size,
             font_size,
             width_opt,
             wrap,
@@ -2617,10 +2620,16 @@ impl ShapeLine {
         }
     }
 
+    /// Lays this line out into `layout_lines`.
+    ///
+    /// `line_height` is the buffer's line height: an
+    /// [`EllipsizeHeightLimit::Height`] limit counts visual lines of this
+    /// height, unless the line's attributes override its metrics.
     pub fn layout_to_buffer(
         &self,
         scratch: &mut ShapeBuffer,
         font_size: f32,
+        line_height: f32,
         width_opt: Option<f32>,
         wrap: Wrap,
         ellipsize: Ellipsize,
@@ -2679,9 +2688,7 @@ impl ShapeLine {
                 | Ellipsize::End(EllipsizeHeightLimit::Height(height)) => Some(height),
                 _ => None,
             };
-            let line_height = self
-                .metrics_opt
-                .map_or_else(|| font_size, |m| m.line_height);
+            let line_height = self.metrics_opt.map_or(line_height, |m| m.line_height);
 
             let try_ellipsize_last_line = |total_line_count: usize,
                                            total_line_height: f32,

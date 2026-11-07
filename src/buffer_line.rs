@@ -250,12 +250,17 @@ impl BufferLine {
         self.shape_opt.is_invalidated() || self.layout_opt.is_invalidated()
     }
 
-    /// Layout line, will cache results
+    /// Layout line, will cache results.
+    ///
+    /// `line_height` is the buffer's line height, which an
+    /// [`EllipsizeHeightLimit::Height`](crate::EllipsizeHeightLimit::Height)
+    /// limit counts in.
     #[allow(clippy::missing_panics_doc)]
     pub fn layout(
         &mut self,
         font_system: &mut FontSystem,
         font_size: f32,
+        line_height: f32,
         width_opt: Option<f32>,
         wrap: Wrap,
         ellipsize: Ellipsize,
@@ -274,6 +279,7 @@ impl BufferLine {
             shape.layout_to_buffer(
                 &mut font_system.shape_buffer,
                 font_size,
+                line_height,
                 width_opt,
                 wrap,
                 ellipsize,

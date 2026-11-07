@@ -800,6 +800,7 @@ impl Buffer {
         Some(line.layout(
             font_system,
             self.metrics.font_size,
+            self.metrics.line_height,
             self.width_opt,
             self.wrap,
             self.ellipsize,
