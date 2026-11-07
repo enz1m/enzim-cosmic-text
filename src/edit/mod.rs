@@ -1,3 +1,4 @@
+// Modified by enzUI contributors. See FORK.md.
 use alloc::sync::Arc;
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
@@ -327,8 +328,20 @@ pub trait Edit<'buffer> {
     /// Get completed change
     fn finish_change(&mut self) -> Option<Change>;
 
-    /// Perform an [Action] on the editor
+    /// Perform an [Action] on the editor.
     fn action(&mut self, font_system: &mut FontSystem, action: Action);
+
+    /// Performs an in-viewport pointer action against layout the caller has
+    /// already prepared.
+    ///
+    /// The default remains conservative. An editor may override this to skip
+    /// dirty discovery when its owner can prove that mutable buffer lines have
+    /// not been exposed since the visible region was shaped. Callers must use
+    /// [`Edit::action`] for out-of-bounds pointers that may need cursor reveal
+    /// or autoscroll.
+    fn action_with_prepared_layout(&mut self, font_system: &mut FontSystem, action: Action) {
+        self.action(font_system, action);
+    }
 
     /// Get X and Y position of the top left corner of the cursor
     fn cursor_position(&self) -> Option<(i32, i32)>;
@@ -359,8 +372,14 @@ impl<'buffer, E: Edit<'buffer>> BorrowedWithFontSystem<'_, E> {
         self.inner.shape_as_needed(self.font_system, prune);
     }
 
-    /// Perform an [Action] on the editor
+    /// Perform an [Action] on the editor.
     pub fn action(&mut self, action: Action) {
         self.inner.action(self.font_system, action);
+    }
+
+    /// Perform an in-viewport pointer action against already prepared layout.
+    pub fn action_with_prepared_layout(&mut self, action: Action) {
+        self.inner
+            .action_with_prepared_layout(self.font_system, action);
     }
 }

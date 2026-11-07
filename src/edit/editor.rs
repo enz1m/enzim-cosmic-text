@@ -1,3 +1,4 @@
+// Modified by enzUI contributors. See FORK.md.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #[cfg(not(feature = "std"))]
@@ -10,9 +11,9 @@ use core::cmp;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
-    render_decoration, Action, Attrs, AttrsList, BorrowedWithFontSystem, BufferLine, BufferRef,
-    Change, ChangeItem, Color, Cursor, Edit, FontSystem, LayoutRun, LineEnding, LineIter, Renderer,
-    Selection, Shaping,
+    Action, Attrs, AttrsList, BorrowedWithFontSystem, BufferLine, BufferRef, Change, ChangeItem,
+    Color, Cursor, Edit, FontSystem, LayoutRun, LineEnding, LineIter, Renderer, Selection, Shaping,
+    render_decoration,
 };
 
 /// A wrapper of [`Buffer`] for easy editing
@@ -167,6 +168,31 @@ impl<'buffer> Editor<'buffer> {
                 }
             }
         });
+    }
+
+    fn click_prepared(&mut self, x: i32, y: i32) {
+        self.set_selection(Selection::None);
+
+        if let Some(new_cursor) = self.with_buffer(|buffer| buffer.hit(x as f32, y as f32)) {
+            if new_cursor != self.cursor {
+                self.cursor = new_cursor;
+                self.with_buffer_mut(|buffer| buffer.set_redraw(true));
+            }
+        }
+    }
+
+    fn drag_prepared(&mut self, x: i32, y: i32) {
+        if self.selection == Selection::None {
+            self.selection = Selection::Normal(self.cursor);
+            self.with_buffer_mut(|buffer| buffer.set_redraw(true));
+        }
+
+        if let Some(new_cursor) = self.with_buffer(|buffer| buffer.hit(x as f32, y as f32)) {
+            if new_cursor != self.cursor {
+                self.cursor = new_cursor;
+                self.with_buffer_mut(|buffer| buffer.set_redraw(true));
+            }
+        }
     }
 }
 
@@ -513,6 +539,22 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
         self.change.take()
     }
 
+    fn action_with_prepared_layout(&mut self, font_system: &mut FontSystem, action: Action) {
+        match action {
+            Action::Click { x, y } => {
+                self.click_prepared(x, y);
+                // `hit` returned a cursor from the prepared visible layout, so
+                // it cannot require vertical reveal or additional shaping.
+                self.cursor_moved = false;
+            }
+            Action::Drag { x, y } => {
+                self.drag_prepared(x, y);
+                self.cursor_moved = false;
+            }
+            action => self.action(font_system, action),
+        }
+    }
+
     fn action(&mut self, font_system: &mut FontSystem, action: Action) {
         let old_cursor = self.cursor;
 
@@ -769,17 +811,8 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                 }
             }
             Action::Click { x, y } => {
-                self.set_selection(Selection::None);
-
-                if let Some(new_cursor) = self.with_buffer_mut(|buffer| {
-                    buffer.shape_until_scroll(font_system, false);
-                    buffer.hit(x as f32, y as f32)
-                }) {
-                    if new_cursor != self.cursor {
-                        self.cursor = new_cursor;
-                        self.with_buffer_mut(|buffer| buffer.set_redraw(true));
-                    }
-                }
+                self.with_buffer_mut(|buffer| buffer.shape_until_scroll(font_system, false));
+                self.click_prepared(x, y);
             }
             Action::DoubleClick { x, y } => {
                 self.set_selection(Selection::None);
@@ -811,20 +844,8 @@ impl<'buffer> Edit<'buffer> for Editor<'buffer> {
                 }
             }
             Action::Drag { x, y } => {
-                if self.selection == Selection::None {
-                    self.selection = Selection::Normal(self.cursor);
-                    self.with_buffer_mut(|buffer| buffer.set_redraw(true));
-                }
-
-                if let Some(new_cursor) = self.with_buffer_mut(|buffer| {
-                    buffer.shape_until_scroll(font_system, false);
-                    buffer.hit(x as f32, y as f32)
-                }) {
-                    if new_cursor != self.cursor {
-                        self.cursor = new_cursor;
-                        self.with_buffer_mut(|buffer| buffer.set_redraw(true));
-                    }
-                }
+                self.with_buffer_mut(|buffer| buffer.shape_until_scroll(font_system, false));
+                self.drag_prepared(x, y);
             }
             Action::Scroll { pixels } => {
                 self.with_buffer_mut(|buffer| {

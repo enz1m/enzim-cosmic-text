@@ -1,3 +1,4 @@
+// Modified by enzUI contributors. See FORK.md.
 #![allow(clippy::too_many_arguments)]
 
 #[cfg(not(feature = "std"))]
@@ -59,7 +60,7 @@ impl BufferLine {
         self.attrs_list = attrs_list;
         self.align = None;
         self.shape_opt.set_unused();
-        self.layout_opt.set_unused();
+        self.reset_layout();
         self.shaping = shaping;
         self.metadata = None;
     }
@@ -207,6 +208,9 @@ impl BufferLine {
 
     /// Reset only layout cache
     pub fn reset_layout(&mut self) {
+        if self.layout_opt.get().is_some() {
+            crate::instrument::layouts_invalidated(1);
+        }
         self.layout_opt.set_unused();
     }
 
@@ -232,7 +236,7 @@ impl BufferLine {
                 direction,
             );
             self.shape_opt.set_used(line);
-            self.layout_opt.set_unused();
+            self.reset_layout();
         }
         self.shape_opt.get().expect("shape not found")
     }

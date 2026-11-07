@@ -1,3 +1,4 @@
+// Modified by enzUI contributors. See FORK.md.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! # COSMIC Text
@@ -120,6 +121,8 @@ mod font;
 
 pub use self::layout::*;
 mod layout;
+
+pub mod instrument;
 
 pub use self::line_ending::*;
 mod line_ending;

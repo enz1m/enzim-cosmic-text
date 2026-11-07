@@ -1,3 +1,4 @@
+// Modified by enzUI contributors. See FORK.md.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #[cfg(not(feature = "std"))]
@@ -431,8 +432,17 @@ impl Buffer {
     fn resolve_dirty(&mut self) -> bool {
         let dirty = self.dirty;
         if dirty.is_empty() {
-            // individual lines may have been externally invalidated
-            if self.lines.iter().any(|line| line.needs_reshaping()) {
+            // `lines` is public, so the conservative entry point must discover
+            // BufferLine invalidation performed outside Buffer's setters.
+            // Count every inspected line, including the matching one.
+            let mut inspected = 0;
+            let externally_dirty = self.lines.iter().any(|line| {
+                inspected += 1;
+                line.needs_reshaping()
+            });
+            crate::instrument::dirty_scan(inspected);
+
+            if externally_dirty {
                 self.redraw = true;
                 return true;
             }
@@ -575,9 +585,14 @@ impl Buffer {
     /// [`hit`]: Self::hit
     #[allow(clippy::missing_panics_doc)]
     pub fn shape_until_scroll(&mut self, font_system: &mut FontSystem, prune: bool) {
+        crate::instrument::shape_call();
         if !self.resolve_dirty() {
             return;
         }
+        self.shape_visible(font_system, prune);
+    }
+
+    fn shape_visible(&mut self, font_system: &mut FontSystem, prune: bool) {
         let metrics = self.metrics;
 
         // Clamp scroll.line to valid range (lines may have been removed by editing)
@@ -709,6 +724,10 @@ impl Buffer {
         line_i: usize,
     ) -> Option<&[LayoutLine]> {
         let line = self.lines.get_mut(line_i)?;
+        let rebuilds_cache = line.needs_reshaping() || line.layout_opt().is_none();
+        if rebuilds_cache {
+            crate::instrument::line_shaped();
+        }
         Some(line.layout(
             font_system,
             self.metrics.font_size,
