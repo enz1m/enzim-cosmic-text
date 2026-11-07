@@ -1,3 +1,4 @@
+// Modified by enzUI contributors. See FORK.md.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #[cfg(not(feature = "std"))]
@@ -262,8 +263,8 @@ mod test {
         .map(std::fs::read) else {
             return;
         };
-        let regular = FontRef::from_index(&sfns, 0).unwrap();
-        let italic = FontRef::from_index(&sfns_italic, 0).unwrap();
+        let regular = FontRef::from_index(&sfns, 0).expect("SFNS contains its regular face");
+        let italic = FontRef::from_index(&sfns_italic, 0).expect("SFNSItalic contains its italic face");
         let wght = Tag::from_be_bytes(*b"wght");
 
         let render = |ctx: &mut ScaleContext, font: FontRef, weight: f32, use_normalized| {

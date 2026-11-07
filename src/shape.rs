@@ -353,7 +353,7 @@ fn shape_run(
         }
     }
 
-    log::trace!("      Run {:?}: '{}'", &scripts, &line[start_run..end_run],);
+    log::trace!("      Run {:?}: '{}'", scripts, &line[start_run..end_run],);
 
     let run = &line[start_run..end_run];
     let emoji_font = if !run.is_ascii()
@@ -3249,9 +3249,9 @@ impl ShapeLine {
                     // emitted in byte order, giving amortized O(1) lookup.
                     let mut deco_cursor: usize = 0;
                     let congruent = is_ellipsis || self.rtl == r.level.is_rtl();
-                    // If ending_glyph is not 0 we need to include glyphs from the ending_word
-                    for i in r.start.word..r.end.word + usize::from(r.end.glyph != 0) {
-                        let word = &span_words[i];
+                    let word_end = r.end.word + usize::from(r.end.glyph != 0);
+                    for (offset, word) in span_words[r.start.word..word_end].iter().enumerate() {
+                        let i = r.start.word + offset;
                         let included_glyphs = match (i == r.start.word, i == r.end.word) {
                             (false, false) => &word.glyphs[..],
                             (true, false) => &word.glyphs[r.start.glyph..],
