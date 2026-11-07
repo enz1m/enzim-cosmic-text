@@ -657,6 +657,11 @@ impl Buffer {
     }
 
     fn shape_visible(&mut self, font_system: &mut FontSystem, prune: bool) {
+        // Dirty resolution let this pass through: the visible window is walked
+        // and its scroll position re-derived. A frame that announces no
+        // mutation must not reach here (enzUI-ICED #1802).
+        crate::instrument::visible_shape_pass();
+
         let metrics = self.metrics;
 
         // Clamp scroll.line to valid range (lines may have been removed by editing)
