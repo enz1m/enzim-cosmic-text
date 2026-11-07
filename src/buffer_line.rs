@@ -214,6 +214,29 @@ impl BufferLine {
         self.layout_opt.set_unused();
     }
 
+    /// Drop the shaping and layout caches together with their allocations.
+    ///
+    /// [`reset_shaping`](Self::reset_shaping) keeps the old values so the next
+    /// shaping can reuse their capacity, which never returns that memory. An
+    /// owner that bounds a long document's memory releases off-screen lines
+    /// with this instead (enzICED #1); the line shapes again from its text and
+    /// attributes on next use.
+    pub fn release_caches(&mut self) {
+        if self.layout_opt.get().is_some() {
+            crate::instrument::layouts_invalidated(1);
+        }
+        self.shape_opt = Cached::Empty;
+        self.layout_opt = Cached::Empty;
+    }
+
+    /// Whether the line holds a shaping or layout cache, used or not.
+    pub const fn holds_caches(&self) -> bool {
+        !matches!(
+            (&self.shape_opt, &self.layout_opt),
+            (Cached::Empty, Cached::Empty)
+        )
+    }
+
     /// Shape line, will cache results
     #[allow(clippy::missing_panics_doc)]
     pub fn shape(
