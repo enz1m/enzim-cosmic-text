@@ -70,6 +70,11 @@ impl BufferLine {
         &self.text
     }
 
+    /// Get the shaping strategy (enzICED).
+    pub fn shaping(&self) -> Shaping {
+        self.shaping
+    }
+
     /// Set text and attributes list
     ///
     /// Will reset shape and layout if it differs from current text and attributes list.
