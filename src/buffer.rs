@@ -31,6 +31,13 @@ bitflags::bitflags! {
         const SCROLL    = 0b1000;
         /// Base direction changed, reshape every line (some characters like '(' are shaped differently based on direction)
         const DIRECTION = 0b1_0000;
+        /// An owner that keeps `lines` encapsulated announced its own direct
+        /// line mutation (enzUI-ICED #1804). Nothing to invalidate here: the
+        /// mutation already dropped whatever caches it invalidated, so this
+        /// only says "a redraw and a re-measure are due", which is exactly
+        /// what the conservative discovery scan concluded when it found the
+        /// same mutation by searching for it.
+        const LINES_MUTATED = 0b10_0000;
     }
 }
 
@@ -351,6 +358,10 @@ pub struct Buffer {
     direction: Direction,
     /// Dirty flags tracking which properties changed since last layout
     dirty: DirtyFlags,
+    /// The owner has promised that `lines` is encapsulated: see
+    /// [`Buffer::set_lines_encapsulated`]. Off by default, so the public API's
+    /// conservative discovery is unchanged for every other caller.
+    lines_encapsulated: bool,
 }
 
 impl Clone for Buffer {
@@ -369,6 +380,10 @@ impl Clone for Buffer {
             hinting: self.hinting,
             direction: self.direction,
             dirty: self.dirty,
+            // A clone's lines belong to whoever holds the clone, and they have
+            // promised nothing. Cloning therefore returns to the conservative
+            // default rather than inheriting someone else's contract.
+            lines_encapsulated: false,
         }
     }
 }
@@ -401,6 +416,7 @@ impl Buffer {
             hinting: Hinting::default(),
             direction: Direction::default(),
             dirty: DirtyFlags::empty(),
+            lines_encapsulated: false,
         }
     }
 
@@ -427,11 +443,59 @@ impl Buffer {
         }
     }
 
+    /// Promise that this buffer's [`lines`](Self::lines) are **encapsulated**:
+    /// that the owner never hands them out mutably, and that any direct
+    /// mutation it makes itself is announced with
+    /// [`note_encapsulated_line_mutation`](Self::note_encapsulated_line_mutation).
+    ///
+    /// Off by default, and this is the only way to turn it on, so the ordinary
+    /// public contract is untouched: a caller who reaches into the public
+    /// `lines` vector -- replacing, pushing, splicing or invalidating a line,
+    /// on screen or far off it -- is still discovered by the conservative scan
+    /// in the shaping entry points.
+    ///
+    /// An owner that *can* make the promise buys an important property: that
+    /// scan reads every line of the document on every shaping pass, which on a
+    /// 920 919 line document cost a measured ~40 ms per frame and was most of
+    /// what made a 40 MB file uneditable (enzUI-ICED #1804). The promise
+    /// replaces the search with the announcement.
+    ///
+    /// # Panics
+    ///
+    /// Never. Breaking the promise does not panic; it makes a mutation the
+    /// buffer was not told about invisible to shaping, which is why the flag
+    /// is opt-in and named after the property it requires.
+    pub fn set_lines_encapsulated(&mut self, encapsulated: bool) {
+        self.lines_encapsulated = encapsulated;
+    }
+
+    /// Whether the owner made the promise in
+    /// [`set_lines_encapsulated`](Self::set_lines_encapsulated).
+    pub const fn lines_encapsulated(&self) -> bool {
+        self.lines_encapsulated
+    }
+
+    /// Announce a direct mutation of [`lines`](Self::lines) made by the owner
+    /// that promised [`set_lines_encapsulated`](Self::set_lines_encapsulated).
+    ///
+    /// This is what that owner uses instead of being found by the discovery
+    /// scan, and it is not restricted to the visible region: announcing a
+    /// change to a line far above the viewport re-measures the document's
+    /// geometry exactly as the scan did.
+    pub fn note_encapsulated_line_mutation(&mut self) {
+        self.dirty |= DirtyFlags::LINES_MUTATED;
+    }
+
     /// Process dirty flags: invalidate shape/layout caches as needed, then clear flags.
     /// Returns `true` if any flags were set (i.e., work may be needed).
     fn resolve_dirty(&mut self) -> bool {
         let dirty = self.dirty;
         if dirty.is_empty() {
+            // The owner promised there is nothing to discover, and announces
+            // its own direct mutations through the flag above (#1804).
+            if self.lines_encapsulated {
+                return false;
+            }
             // `lines` is public, so the conservative entry point must discover
             // BufferLine invalidation performed outside Buffer's setters.
             // Count every inspected line, including the matching one.
