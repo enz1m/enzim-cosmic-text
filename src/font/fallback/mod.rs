@@ -1,3 +1,4 @@
+// Modified by enzUI contributors. See FORK.md.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use alloc::borrow::ToOwned;
@@ -299,6 +300,13 @@ impl<'a> FontFallbackIter<'a> {
             .iter()
             .filter(|m_key| m_key.font_weight_diff == 0 || m_key.variable_weight_match)
             .find(|m_key| self.face_contains_family(m_key.id, default_family_name))
+            // The cached match list starts with fontdb's CSS match. Keep that
+            // family's nearest face before trying unrelated exact-weight fonts.
+            .or_else(|| {
+                self.font_match_keys
+                    .iter()
+                    .find(|m_key| self.face_contains_family(m_key.id, default_family_name))
+            })
     }
 
     fn next_item(&mut self, fallbacks: &Fallbacks) -> Option<<Self as Iterator>::Item> {
