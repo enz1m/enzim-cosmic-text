@@ -103,7 +103,11 @@ impl LayoutGlyph {
             self.font_size * scale,
             (
                 (self.x + x_offset).mul_add(scale, offset.0),
-                math::truncf((self.y - y_offset).mul_add(scale, offset.1)), // Hinting in Y axis
+                // Hinting in Y axis. enzUI-ICED #3091: nearest, not `truncf`.
+                // Truncation always snapped a glyph up, by up to one physical
+                // pixel (half on average), so text sat high in every centred
+                // control, most visibly at fractional scales.
+                math::roundf((self.y - y_offset).mul_add(scale, offset.1)),
             ),
             self.font_weight,
             self.cache_key_flags,
