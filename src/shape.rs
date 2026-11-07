@@ -2141,7 +2141,10 @@ impl ShapeLine {
             for word_idx in word_indices {
                 let word = &span.words[word_idx];
                 let span_pad = span.word_pad(word_idx);
-                let word_width = if span_index == start.span && word_idx == start.word {
+                let word_width = if span_index == start.span
+                    && word_idx == start.word
+                    && (start.word, start.glyph) != (0, 0)
+                {
                     let (start_glyph_pos, end_glyph_pos) = Self::get_glyph_start_end(
                         word, start, span_index, word_idx, direction, congruent,
                     );
