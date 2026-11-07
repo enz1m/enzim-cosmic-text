@@ -1,3 +1,4 @@
+// Modified by enzUI contributors. See FORK.md.
 use crate::{Attrs, Font, FontMatchAttrs, HashMap, ShapeBuffer};
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
@@ -29,19 +30,62 @@ pub struct FontMatchKey {
     pub(crate) variable_weight_match: bool,
 }
 
+/// The `wght` axis range of every face read so far, keyed by face.
+///
+/// Matching a new weight used to open and parse every font file in the
+/// database to read this axis, which with ~1 500 system faces stalled the
+/// first text in a new weight by tens of milliseconds, and far longer once the
+/// files left the page cache (enzUI-ICED #3399). The range never changes for a
+/// face, so each file is read at most once.
+#[derive(Debug, Default)]
+pub(crate) struct WeightAxes {
+    ranges: HashMap<fontdb::ID, Option<(f32, f32)>>,
+    /// Font files read to fill `ranges`.
+    #[cfg(test)]
+    reads: usize,
+}
+
+impl WeightAxes {
+    fn range(&mut self, face: &FaceInfo, db: &fontdb::Database) -> Option<(f32, f32)> {
+        #[cfg(test)]
+        let reads = &mut self.reads;
+        *self.ranges.entry(face.id).or_insert_with(|| {
+            #[cfg(test)]
+            {
+                *reads += 1;
+            }
+            db.with_face_data(face.id, |font_data, face_index| {
+                let font_ref = skrifa::FontRef::from_index(font_data, face_index).ok()?;
+                let axis = font_ref.axes().get_by_tag(skrifa::Tag::new(b"wght"))?;
+                Some((axis.min_value(), axis.max_value()))
+            })
+            .flatten()
+        })
+    }
+
+    /// Font files read so far.
+    #[cfg(test)]
+    pub(crate) fn reads(&self) -> usize {
+        self.reads
+    }
+}
+
 impl FontMatchKey {
-    fn new(attrs: &Attrs, face: &FaceInfo, db: &fontdb::Database) -> FontMatchKey {
+    fn new(
+        attrs: &Attrs,
+        face: &FaceInfo,
+        db: &fontdb::Database,
+        axes: &mut WeightAxes,
+    ) -> FontMatchKey {
         // TODO: smarter way of detecting emoji
         let not_emoji = !face.post_script_name.contains("Emoji");
         let font_weight_diff = attrs.weight.0.abs_diff(face.weight.0);
 
         let variable_weight_match = font_weight_diff != 0
-            && db.with_face_data(face.id, |font_data, face_index| {
-                let font_ref = skrifa::FontRef::from_index(font_data, face_index).ok()?;
-                let axis = font_ref.axes().get_by_tag(skrifa::Tag::new(b"wght"))?;
+            && axes.range(face, db).is_some_and(|(min, max)| {
                 let w = attrs.weight.0 as f32;
-                Some(w >= axis.min_value() && w <= axis.max_value())
-            }) == Some(Some(true));
+                w >= min && w <= max
+            });
         let font_weight = face.weight.0;
         let font_stretch_diff = attrs.stretch.to_number().abs_diff(face.stretch.to_number());
         let font_stretch = face.stretch.to_number();
@@ -178,6 +222,9 @@ pub struct FontSystem {
 
     /// Cache for font matches.
     font_matches_cache: HashMap<FontMatchAttrs, Arc<Vec<FontMatchKey>>>,
+
+    /// Each face's weight axis, read once (enzUI-ICED #3399).
+    pub(crate) weight_axes: WeightAxes,
 
     /// Cache for monospace font matches.
     monospace_font_matches_cache: HashMap<FontMatchAttrs, Arc<MonoFontMatches>>,
@@ -378,6 +425,7 @@ impl FontSystem {
             per_script_monospace_font_ids,
             font_cache: HashMap::default(),
             font_matches_cache: HashMap::default(),
+            weight_axes: WeightAxes::default(),
             monospace_font_matches_cache: HashMap::default(),
             monospace_rankings_cache: HashMap::default(),
             font_codepoint_support_info_cache: HashMap::default(),
@@ -408,6 +456,7 @@ impl FontSystem {
     /// Get a mutable reference to the database.
     pub fn db_mut(&mut self) -> &mut fontdb::Database {
         self.font_matches_cache.clear();
+        self.weight_axes = WeightAxes::default();
         self.monospace_font_matches_cache.clear();
         self.monospace_rankings_cache.clear();
         &mut self.db
@@ -490,10 +539,10 @@ impl FontSystem {
                 #[cfg(all(feature = "std", not(target_arch = "wasm32")))]
                 let now = std::time::Instant::now();
 
-                let mut font_match_keys = self
-                    .db
+                let (db, axes) = (&self.db, &mut self.weight_axes);
+                let mut font_match_keys = db
                     .faces()
-                    .map(|face| FontMatchKey::new(attrs, face, &self.db))
+                    .map(|face| FontMatchKey::new(attrs, face, db, axes))
                     .collect::<Vec<_>>();
 
                 // Sort so we get the keys with weight_offset=0 first
@@ -519,7 +568,7 @@ impl FontSystem {
                         font_match_keys.insert(0, match_key);
                     } else if let Some(face) = self.db.face(id) {
                         // else insert in front
-                        let match_key = FontMatchKey::new(attrs, face, &self.db);
+                        let match_key = FontMatchKey::new(attrs, face, db, axes);
                         font_match_keys.insert(0, match_key);
                     } else {
                         log::error!("Could not get face from db, that should've been there.");
@@ -778,5 +827,52 @@ impl<T> Deref for BorrowedWithFontSystem<'_, T> {
 impl<T> DerefMut for BorrowedWithFontSystem<'_, T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.inner
+    }
+}
+
+#[cfg(test)]
+mod weight_axis_tests {
+    use super::*;
+    use crate::Weight;
+
+    /// Matching several weights reads each font file at most once (#3399).
+    ///
+    /// Sabotage: make `WeightAxes::range` re-read the file on every call; the
+    /// reads grow with every weight matched.
+    #[test]
+    fn matching_new_weights_reads_each_font_file_at_most_once() {
+        let mut fonts = FontSystem::new();
+        let faces = fonts.db().len();
+        assert!(faces > 0, "the host must have system fonts");
+        let weights = [
+            Weight::NORMAL,
+            Weight::MEDIUM,
+            Weight::SEMIBOLD,
+            Weight::BOLD,
+        ];
+
+        // A face is read only for a weight it does not have, so the first
+        // weight reads some faces and later ones read the rest.
+        for weight in weights {
+            let matches = fonts.get_font_matches(&Attrs::new().weight(weight));
+            assert!(matches.len() >= faces, "every face is ranked");
+        }
+        let reads = fonts.weight_axes.reads();
+        assert!(
+            reads > 0 && reads <= faces,
+            "{reads} reads for {faces} faces"
+        );
+
+        // Matching the same weights again, after the match cache is gone,
+        // reads nothing more.
+        fonts.font_matches_cache.clear();
+        for weight in weights {
+            let _ = fonts.get_font_matches(&Attrs::new().weight(weight));
+        }
+        assert_eq!(
+            fonts.weight_axes.reads(),
+            reads,
+            "weights re-read font files"
+        );
     }
 }
