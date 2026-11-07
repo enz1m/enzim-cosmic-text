@@ -1,3 +1,4 @@
+// Modified by enzUI contributors. See FORK.md.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 #![allow(clippy::too_many_arguments)]
@@ -3323,9 +3324,16 @@ impl ShapeLine {
                                 .get(deco_cursor)
                                 .filter(|(range, _)| glyph.start >= range.start);
                             let glyph_idx = glyphs.len() - 1;
+                            // A span covers CONSECUTIVE glyphs, so the open
+                            // span may only grow when it ends at this glyph.
+                            // Matching on the decoration data alone reopened a
+                            // span across undecorated glyphs, which underlined
+                            // the space between two separately underlined
+                            // words.
                             let extends = matches!(
                                 (decorations.last(), &glyph_deco),
-                                (Some(span), Some((_, d))) if span.data == *d
+                                (Some(span), Some((_, d)))
+                                    if span.data == *d && span.glyph_range.end == glyph_idx
                             );
                             if extends {
                                 if let Some(last) = decorations.last_mut() {
