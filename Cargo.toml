@@ -6,7 +6,8 @@ authors = ["Jeremy Soller <jeremy@system76.com>"]
 edition = "2021"
 license = "MIT OR Apache-2.0"
 documentation = "https://docs.rs/cosmic-text/latest/cosmic_text/"
-repository = "https://github.com/pop-os/cosmic-text"
+repository = "https://github.com/enz1m/enzim-cosmic-text"
+homepage = "https://github.com/enz1m/enzim-cosmic-text"
 rust-version = "1.89"
 
 [dependencies]
