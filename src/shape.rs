@@ -3143,6 +3143,12 @@ impl ShapeLine {
                 x = x.round();
             }
 
+            // The shift from the unaligned origin, not an absolute position:
+            // zero for every unaligned row, and signed with the paragraph
+            // direction for the rest. Captured before the glyph loop advances
+            // `x`.
+            let row_align_offset = x - start_x;
+
             // TODO: Only certain `is_whitespace` chars are typically expanded but this is what is
             // currently used to compute `visual_line.spaces`.
             //
@@ -3434,6 +3440,7 @@ impl ShapeLine {
                 uses_base_line_height,
                 glyphs,
                 decorations,
+                align_offset: row_align_offset,
             });
         }
 
@@ -3443,6 +3450,27 @@ impl ShapeLine {
             // determined by the default attrs' line height (e.g. when the
             // line is inside a span with its own metrics), falling back to
             // the buffer's base line height.
+            // An empty row has no width to correct against, so the correction
+            // collapses to the whole column: centred puts the caret in the
+            // middle, right and end at the trailing edge.
+            let empty_correction = match (align, self.rtl) {
+                (Align::Left, true) => line_width,
+                (Align::Left, false) => 0.0,
+                (Align::Right, true) => 0.0,
+                (Align::Right, false) => line_width,
+                (Align::Center, _) => line_width / 2.0,
+                (Align::End, _) => line_width,
+                (Align::Justified, _) => 0.0,
+            };
+            let mut empty_align_offset = if self.rtl {
+                -empty_correction
+            } else {
+                empty_correction
+            };
+            if hinting == Hinting::Enabled {
+                empty_align_offset = empty_align_offset.round();
+            }
+
             layout_lines.push(LayoutLine {
                 w: 0.0,
                 max_ascent: 0.0,
@@ -3451,6 +3479,7 @@ impl ShapeLine {
                 uses_base_line_height: false,
                 glyphs: Vec::default(),
                 decorations: Vec::new(),
+                align_offset: empty_align_offset,
             });
         }
 

@@ -1,3 +1,4 @@
+// Modified by enzUI contributors. See FORK.md.
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use core::fmt::Display;
@@ -136,6 +137,19 @@ pub struct LayoutLine {
     pub glyphs: Vec<LayoutGlyph>,
     /// Text decoration spans covering ranges of glyphs
     pub decorations: Vec<DecorationSpan>,
+    /// How far alignment moved this row from where an unaligned row would
+    /// start, in the same units as [`LayoutGlyph::x`] and hinted the same way.
+    ///
+    /// Signed with the paragraph's direction: positive moves a left-to-right
+    /// row toward the trailing edge, negative moves a right-to-left one. It is
+    /// `0.0` for every unaligned row, so a reader that assumes rows begin where
+    /// they always did keeps its answer by adding this.
+    ///
+    /// A row with no glyphs — an empty line, or one holding only a line ending
+    /// — has no glyph to read a position off, which is the case this field
+    /// exists for: the caret of an empty centred paragraph belongs at the
+    /// centre of the column.
+    pub align_offset: f32,
 }
 
 impl LayoutLine {
