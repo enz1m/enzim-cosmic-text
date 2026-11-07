@@ -153,7 +153,15 @@ pub struct LayoutLine {
     /// — has no glyph to read a position off, which is the case this field
     /// exists for: the caret of an empty centred paragraph belongs at the
     /// centre of the column.
+    ///
+    /// A row laid out beside an [`Exclusion`](crate::Exclusion) also counts
+    /// its leading inset here: the row starts that much further in.
     pub align_offset: f32,
+    /// Space above the row that it skipped to get below an
+    /// [`Exclusion`](crate::Exclusion) leaving no usable gap at its height;
+    /// `0.0` otherwise. [`Self::line_height`] includes it, so the row's
+    /// content starts this far below the row's top.
+    pub top_gap: f32,
 }
 
 impl LayoutLine {
@@ -165,7 +173,15 @@ impl LayoutLine {
     /// entirely within such a span, or an empty line inside it); otherwise
     /// the base line height wins and the span has no impact on the line's
     /// height.
+    ///
+    /// It includes [`Self::top_gap`]; [`Self::content_height`] does not.
     pub const fn line_height(&self, line_height: f32) -> f32 {
+        self.content_height(line_height) + self.top_gap
+    }
+
+    /// The height of the row's content given the buffer's base
+    /// `line_height`: [`Self::line_height`] without [`Self::top_gap`].
+    pub const fn content_height(&self, line_height: f32) -> f32 {
         match (self.uses_base_line_height, self.line_height_opt) {
             (true, Some(span_line_height)) if span_line_height > line_height => span_line_height,
             (true, _) => line_height,

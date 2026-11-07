@@ -12,8 +12,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     render_decoration, Affinity, Align, Attrs, AttrsList, BidiParagraphs, BorrowedWithFontSystem,
-    BufferLine, Color, Cursor, DecorationSpan, Direction, Ellipsize, FontSystem, Hinting,
-    LayoutCursor, LayoutGlyph, LayoutLine, LineEnding, LineIter, Motion, Renderer, Scroll,
+    BufferLine, Color, Cursor, DecorationSpan, Direction, Ellipsize, Exclusion, FontSystem,
+    Hinting, LayoutCursor, LayoutGlyph, LayoutLine, LineEnding, LineIter, Motion, Renderer, Scroll,
     ShapeLine, Shaping, Wrap,
 };
 
@@ -62,6 +62,10 @@ pub struct LayoutRun<'a> {
     pub line_height: f32,
     /// Width of line
     pub line_w: f32,
+    /// Space above [`Self::line_top`] the row skipped to get below an
+    /// [`Exclusion`](crate::Exclusion) (see [`LayoutLine::top_gap`]); a point
+    /// in it belongs to this row.
+    pub top_gap: f32,
 }
 
 impl LayoutRun<'_> {
@@ -261,10 +265,13 @@ impl<'b> Iterator for LayoutRunIter<'b> {
             while let Some(layout_line) = layout.get(self.layout_i) {
                 self.layout_i += 1;
 
-                let line_height = layout_line.line_height(self.line_height);
-                self.total_height += line_height;
+                let full_height = layout_line.line_height(self.line_height);
+                self.total_height += full_height;
 
-                let line_top = self.line_top - self.scroll;
+                // A row that skipped space to get below an exclusion starts
+                // that far down, and its content is centred in what is left.
+                let line_height = layout_line.content_height(self.line_height);
+                let line_top = self.line_top - self.scroll + layout_line.top_gap;
                 let glyph_height = layout_line.max_ascent + layout_line.max_descent;
                 let centering_offset = (line_height - glyph_height) / 2.0;
                 let line_y = line_top + centering_offset + layout_line.max_ascent;
@@ -273,7 +280,7 @@ impl<'b> Iterator for LayoutRunIter<'b> {
                         return None;
                     }
                 }
-                self.line_top += line_height;
+                self.line_top += full_height;
                 if line_y + layout_line.max_descent < 0.0 {
                     continue;
                 }
@@ -288,6 +295,7 @@ impl<'b> Iterator for LayoutRunIter<'b> {
                     line_top,
                     line_height,
                     line_w: layout_line.w,
+                    top_gap: layout_line.top_gap,
                 });
             }
             self.line_i += 1;
@@ -362,6 +370,8 @@ pub struct Buffer {
     /// [`Buffer::set_lines_encapsulated`]. Off by default, so the public API's
     /// conservative discovery is unchanged for every other caller.
     lines_encapsulated: bool,
+    /// Rectangles the text flows around; see [`Buffer::set_exclusions`].
+    exclusions: Vec<Exclusion>,
 }
 
 impl Clone for Buffer {
@@ -384,8 +394,19 @@ impl Clone for Buffer {
             // promised nothing. Cloning therefore returns to the conservative
             // default rather than inheriting someone else's contract.
             lines_encapsulated: false,
+            exclusions: self.exclusions.clone(),
         }
     }
+}
+
+/// The lowest bottom among `exclusions`, or negative infinity when none
+/// excludes anything.
+fn reach(exclusions: &[Exclusion]) -> f32 {
+    exclusions
+        .iter()
+        .filter(|e| !e.is_empty())
+        .map(Exclusion::bottom)
+        .fold(f32::NEG_INFINITY, f32::max)
 }
 
 impl Buffer {
@@ -417,6 +438,7 @@ impl Buffer {
             direction: Direction::default(),
             dirty: DirtyFlags::empty(),
             lines_encapsulated: false,
+            exclusions: Vec::new(),
         }
     }
 
@@ -792,12 +814,37 @@ impl Buffer {
         font_system: &mut FontSystem,
         line_i: usize,
     ) -> Option<&[LayoutLine]> {
-        let line = self.lines.get_mut(line_i)?;
+        if line_i >= self.lines.len() {
+            return None;
+        }
+        if self.exclusions.is_empty() {
+            return Some(self.line_layout_at(font_system, line_i, None));
+        }
+        let (top, resolved) = self.walk_flow(font_system, line_i);
+        let flow = top.filter(|top| *top < reach(&resolved));
+        Some(self.line_layout_at(
+            font_system,
+            line_i,
+            flow.map(|top| crate::flow::Flow {
+                exclusions: &resolved,
+                top,
+            }),
+        ))
+    }
+
+    /// Lay out `line_i`, flowing around `flow`'s exclusions when it is set.
+    fn line_layout_at(
+        &mut self,
+        font_system: &mut FontSystem,
+        line_i: usize,
+        flow: Option<crate::flow::Flow<'_>>,
+    ) -> &[LayoutLine] {
+        let line = &mut self.lines[line_i];
         let rebuilds_cache = line.needs_reshaping() || line.layout_opt().is_none();
         if rebuilds_cache {
             crate::instrument::line_shaped();
         }
-        Some(line.layout(
+        line.layout_in_flow(
             font_system,
             self.metrics.font_size,
             self.metrics.line_height,
@@ -808,7 +855,108 @@ impl Buffer {
             self.tab_width,
             self.hinting,
             self.direction,
-        ))
+            flow,
+        )
+    }
+
+    /// Walk the lines above `line_i` from the top, laying each out, and
+    /// resolve the exclusions anchored to the lines reached (`line_i`'s
+    /// included) into content coordinates. Returns `line_i`'s top, or `None`
+    /// when the walk stopped early: once the lines are below every resolved
+    /// exclusion and no anchor remains up to `line_i`, nothing can reach it.
+    ///
+    /// The walk therefore costs the lines down to the lowest exclusion or
+    /// anchor, not the document.
+    fn walk_flow(
+        &mut self,
+        font_system: &mut FontSystem,
+        line_i: usize,
+    ) -> (Option<f32>, Vec<Exclusion>) {
+        let mut resolved: Vec<Exclusion> = self
+            .exclusions
+            .iter()
+            .filter(|e| e.line.is_none())
+            .copied()
+            .collect();
+        let last_anchor = self
+            .exclusions
+            .iter()
+            .filter_map(|e| e.line)
+            .filter(|line| *line <= line_i)
+            .max();
+        let line_height = self.metrics.line_height;
+        let mut top = 0.0;
+        for line in 0..=line_i {
+            for e in &self.exclusions {
+                if e.line == Some(line) {
+                    resolved.push(Exclusion {
+                        y: top + e.y,
+                        line: None,
+                        ..*e
+                    });
+                }
+            }
+            if line == line_i {
+                return (Some(top), resolved);
+            }
+            let reach = reach(&resolved);
+            if top >= reach && last_anchor.is_none_or(|anchor| anchor <= line) {
+                return (None, resolved);
+            }
+            let flow = (top < reach).then_some(crate::flow::Flow {
+                exclusions: &resolved,
+                top,
+            });
+            top += self
+                .line_layout_at(font_system, line, flow)
+                .iter()
+                .map(|row| row.line_height(line_height))
+                .sum::<f32>();
+        }
+        (Some(top), resolved)
+    }
+
+    /// Each exclusion in content coordinates, in the order they were set, an
+    /// anchored one placed at its line's current top; `None` for one anchored
+    /// past the last line. Lays out the lines down to the anchors to find them.
+    pub fn resolved_exclusions(&mut self, font_system: &mut FontSystem) -> Vec<Option<Exclusion>> {
+        let exclusions = self.exclusions.clone();
+        exclusions
+            .iter()
+            .map(|e| match e.line {
+                None => Some(*e),
+                Some(line) if line < self.lines.len() => {
+                    self.walk_flow(font_system, line).0.map(|top| Exclusion {
+                        y: top + e.y,
+                        line: None,
+                        ..*e
+                    })
+                }
+                Some(_) => None,
+            })
+            .collect()
+    }
+
+    /// Set the rectangles the text flows around, in content coordinates (see
+    /// [`Exclusion`]). Each wrapped row is laid out in the widest gap they
+    /// leave at its height, and a row they leave no usable gap for moves
+    /// below them. Rows only flow when the buffer has a width and wraps.
+    ///
+    /// Laying out a line finds its top by laying out the lines above it, down
+    /// to the lowest exclusion or anchor, so the cost grows with how far down
+    /// the exclusions reach, not with the document.
+    pub fn set_exclusions(&mut self, exclusions: &[Exclusion]) {
+        if self.exclusions != exclusions {
+            self.exclusions.clear();
+            self.exclusions.extend_from_slice(exclusions);
+            self.dirty |= DirtyFlags::RELAYOUT;
+            self.redraw = true;
+        }
+    }
+
+    /// The rectangles the text flows around; see [`Self::set_exclusions`].
+    pub fn exclusions(&self) -> &[Exclusion] {
+        &self.exclusions
     }
 
     /// Get the current [`Metrics`]
@@ -1265,8 +1413,8 @@ impl Buffer {
         let mut runs = self.layout_runs().peekable();
         let mut first_run = true;
         while let Some(run) = runs.next() {
-            let line_top = run.line_top;
-            let line_height = run.line_height;
+            let line_top = run.line_top - run.top_gap;
+            let line_height = run.line_height + run.top_gap;
 
             if first_run && y < line_top {
                 first_run = false;

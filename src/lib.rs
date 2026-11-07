@@ -117,6 +117,9 @@ mod cursor;
 pub use self::edit::*;
 mod edit;
 
+pub use self::flow::Exclusion;
+mod flow;
+
 pub use self::font::*;
 mod font;
 

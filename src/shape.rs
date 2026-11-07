@@ -2641,6 +2641,61 @@ impl ShapeLine {
         match_mono_width: Option<f32>,
         hinting: Hinting,
     ) {
+        self.layout_to_buffer_in_flow(
+            scratch,
+            font_size,
+            line_height,
+            width_opt,
+            wrap,
+            ellipsize,
+            align,
+            layout_lines,
+            match_mono_width,
+            hinting,
+            None,
+        );
+    }
+
+    /// [`Self::layout_to_buffer`], with each wrapped row laid out in the gap
+    /// `flow`'s exclusions leave at its height (see [`crate::flow`]).
+    pub(crate) fn layout_to_buffer_in_flow(
+        &self,
+        scratch: &mut ShapeBuffer,
+        font_size: f32,
+        line_height: f32,
+        width_opt: Option<f32>,
+        wrap: Wrap,
+        ellipsize: Ellipsize,
+        align: Option<Align>,
+        layout_lines: &mut Vec<LayoutLine>,
+        match_mono_width: Option<f32>,
+        hinting: Hinting,
+        flow: Option<crate::flow::Flow<'_>>,
+    ) {
+        // Each wrapped row's leading inset, wrap width and skipped space. Empty
+        // without exclusions, a wrap width or wrapping, which leaves every row
+        // at the full width as before.
+        let mut bands = Vec::new();
+        if let (Some(flow), Some(width), false) = (flow, width_opt, wrap == Wrap::None) {
+            crate::flow::row_bands(
+                flow,
+                self.metrics_opt.map_or(line_height, |m| m.line_height),
+                width,
+                font_size * 4.0,
+                &mut bands,
+            );
+        }
+        let band = |row: usize| {
+            bands.get(row).copied().unwrap_or(crate::flow::RowBand {
+                left: 0.0,
+                width: width_opt.unwrap_or(0.0),
+                gap: 0.0,
+            })
+        };
+        let row_width = |row: usize| match bands.get(row) {
+            Some(band) => band.width,
+            None => width_opt.unwrap_or(f32::INFINITY),
+        };
         // For each visual line a list of  (span index,  and range of words in that span)
         // Note that a BiDi visual line could have multiple spans or parts of them
         // let mut vl_range_of_spans = Vec::with_capacity(1);
@@ -2745,11 +2800,11 @@ impl ShapeLine {
                             // relayouts with that width as the `line_width` will produce the same
                             // wrapping results.
                             if current_visual_line.w + (word_range_width + word_width)
-                            <= width_opt.unwrap_or(f32::INFINITY)
+                            <= row_width(visual_lines.len())
                             // Include one blank word over the width limit since it won't be
                             // counted in the final width
                             || (word.blank
-                                && (current_visual_line.w + word_range_width) <= width_opt.unwrap_or(f32::INFINITY))
+                                && (current_visual_line.w + word_range_width) <= row_width(visual_lines.len()))
                             {
                                 // fits
                                 if word.blank {
@@ -2759,12 +2814,12 @@ impl ShapeLine {
                                 word_range_width += word_width;
                             } else if wrap == Wrap::Glyph
                             // Make sure that the word is able to fit on it's own line, if not, fall back to Glyph wrapping.
-                            || (wrap == Wrap::WordOrGlyph && word_width > width_opt.unwrap_or(f32::INFINITY))
+                            || (wrap == Wrap::WordOrGlyph && word_width > row_width(visual_lines.len()))
                             {
                                 // Commit the current line so that the word starts on the next line.
                                 if word_range_width > 0.
                                     && wrap == Wrap::WordOrGlyph
-                                    && word_width > width_opt.unwrap_or(f32::INFINITY)
+                                    && word_width > row_width(visual_lines.len())
                                 {
                                     self.add_to_visual_line(
                                         &mut current_visual_line,
@@ -2812,7 +2867,7 @@ impl ShapeLine {
                                         glyph_width += trail;
                                     }
                                     if current_visual_line.w + (word_range_width + glyph_width)
-                                        <= width_opt.unwrap_or(f32::INFINITY)
+                                        <= row_width(visual_lines.len())
                                     {
                                         word_range_width += glyph_width;
                                     } else {
@@ -2944,11 +2999,11 @@ impl ShapeLine {
                         for (i, word) in span.words.iter().enumerate() {
                             let word_width = word.width(font_size) + span.word_pad(i);
                             if current_visual_line.w + (word_range_width + word_width)
-                            <= width_opt.unwrap_or(f32::INFINITY)
+                            <= row_width(visual_lines.len())
                             // Include one blank word over the width limit since it won't be
                             // counted in the final width.
                             || (word.blank
-                                && (current_visual_line.w + word_range_width) <= width_opt.unwrap_or(f32::INFINITY))
+                                && (current_visual_line.w + word_range_width) <= row_width(visual_lines.len()))
                             {
                                 // fits
                                 if word.blank {
@@ -2958,12 +3013,12 @@ impl ShapeLine {
                                 word_range_width += word_width;
                             } else if wrap == Wrap::Glyph
                             // Make sure that the word is able to fit on it's own line, if not, fall back to Glyph wrapping.
-                            || (wrap == Wrap::WordOrGlyph && word_width > width_opt.unwrap_or(f32::INFINITY))
+                            || (wrap == Wrap::WordOrGlyph && word_width > row_width(visual_lines.len()))
                             {
                                 // Commit the current line so that the word starts on the next line.
                                 if word_range_width > 0.
                                     && wrap == Wrap::WordOrGlyph
-                                    && word_width > width_opt.unwrap_or(f32::INFINITY)
+                                    && word_width > row_width(visual_lines.len())
                                 {
                                     self.add_to_visual_line(
                                         &mut current_visual_line,
@@ -3011,7 +3066,7 @@ impl ShapeLine {
                                         glyph_width += lead + mid;
                                     }
                                     if current_visual_line.w + (word_range_width + glyph_width)
-                                        <= width_opt.unwrap_or(f32::INFINITY)
+                                        <= row_width(visual_lines.len())
                                     {
                                         word_range_width += glyph_width;
                                     } else {
@@ -3154,6 +3209,8 @@ impl ShapeLine {
             width
         });
 
+        // Where an unaligned row of the full width starts; `align_offset` is
+        // measured from here.
         let start_x = if self.rtl { line_width } else { 0.0 };
 
         let number_of_visual_lines = visual_lines.len();
@@ -3167,7 +3224,22 @@ impl ShapeLine {
             let mut glyphs = cached_glyph_sets
                 .pop()
                 .unwrap_or_else(|| Vec::with_capacity(1));
-            let mut x = start_x;
+            // A row beside an exclusion starts at its band's leading edge and
+            // aligns within the band.
+            let row = band(index);
+            let line_width = if bands.is_empty() {
+                line_width
+            } else {
+                row.width
+            };
+            let mut x = if bands.is_empty() {
+                start_x
+            } else if self.rtl {
+                row.left + row.width
+            } else {
+                row.left
+            };
+            let row_start_x = x;
             let mut y = 0.;
             let mut max_ascent: f32 = 0.;
             let mut max_descent: f32 = 0.;
@@ -3478,9 +3550,9 @@ impl ShapeLine {
                 w: if align != Align::Justified {
                     visual_line.w
                 } else if self.rtl {
-                    start_x - x
+                    row_start_x - x
                 } else {
-                    x
+                    x - row_start_x
                 },
                 max_ascent,
                 max_descent,
@@ -3489,6 +3561,7 @@ impl ShapeLine {
                 glyphs,
                 decorations,
                 align_offset: row_align_offset,
+                top_gap: row.gap,
             });
         }
 
@@ -3498,9 +3571,23 @@ impl ShapeLine {
             // determined by the default attrs' line height (e.g. when the
             // line is inside a span with its own metrics), falling back to
             // the buffer's base line height.
+            //
             // An empty row has no width to correct against, so the correction
             // collapses to the whole column: centred puts the caret in the
             // middle, right and end at the trailing edge.
+            let row = band(0);
+            let row_start = if bands.is_empty() {
+                0.0
+            } else if self.rtl {
+                row.left + row.width - line_width
+            } else {
+                row.left
+            };
+            let line_width = if bands.is_empty() {
+                line_width
+            } else {
+                row.width
+            };
             let empty_correction = match (align, self.rtl) {
                 (Align::Left, true) => line_width,
                 (Align::Left, false) => 0.0,
@@ -3510,11 +3597,12 @@ impl ShapeLine {
                 (Align::End, _) => line_width,
                 (Align::Justified, _) => 0.0,
             };
-            let mut empty_align_offset = if self.rtl {
-                -empty_correction
-            } else {
-                empty_correction
-            };
+            let mut empty_align_offset = row_start
+                + if self.rtl {
+                    -empty_correction
+                } else {
+                    empty_correction
+                };
             if hinting == Hinting::Enabled {
                 empty_align_offset = empty_align_offset.round();
             }
@@ -3528,6 +3616,7 @@ impl ShapeLine {
                 glyphs: Vec::default(),
                 decorations: Vec::new(),
                 align_offset: empty_align_offset,
+                top_gap: row.gap,
             });
         }
 

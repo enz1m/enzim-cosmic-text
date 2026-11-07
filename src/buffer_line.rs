@@ -21,6 +21,9 @@ pub struct BufferLine {
     layout_opt: Cached<Vec<LayoutLine>>,
     shaping: Shaping,
     metadata: Option<usize>,
+    /// The paragraph top the cached layout flowed around exclusions at, or
+    /// `None` when it was laid out without any.
+    flow_top: Option<f32>,
 }
 
 impl BufferLine {
@@ -42,6 +45,7 @@ impl BufferLine {
             layout_opt: Cached::Empty,
             shaping,
             metadata: None,
+            flow_top: None,
         }
     }
 
@@ -297,6 +301,42 @@ impl BufferLine {
         hinting: Hinting,
         direction: Direction,
     ) -> &[LayoutLine] {
+        self.layout_in_flow(
+            font_system,
+            font_size,
+            line_height,
+            width_opt,
+            wrap,
+            ellipsize,
+            match_mono_width,
+            tab_width,
+            hinting,
+            direction,
+            None,
+        )
+    }
+
+    /// [`Self::layout`] around `flow`'s exclusions. A cached layout made at
+    /// another paragraph top, or with or without exclusions where this call
+    /// differs, is laid out again.
+    pub(crate) fn layout_in_flow(
+        &mut self,
+        font_system: &mut FontSystem,
+        font_size: f32,
+        line_height: f32,
+        width_opt: Option<f32>,
+        wrap: Wrap,
+        ellipsize: Ellipsize,
+        match_mono_width: Option<f32>,
+        tab_width: u16,
+        hinting: Hinting,
+        direction: Direction,
+        flow: Option<crate::flow::Flow<'_>>,
+    ) -> &[LayoutLine] {
+        let flow_top = flow.map(|flow| flow.top);
+        if flow_top != self.flow_top {
+            self.reset_layout();
+        }
         if self.layout_opt.is_unused() {
             let align = self.align;
             let mut layout = self
@@ -304,7 +344,7 @@ impl BufferLine {
                 .take_unused()
                 .unwrap_or_else(|| Vec::with_capacity(1));
             let shape = self.shape(font_system, tab_width, direction);
-            shape.layout_to_buffer(
+            shape.layout_to_buffer_in_flow(
                 &mut font_system.shape_buffer,
                 font_size,
                 line_height,
@@ -315,10 +355,19 @@ impl BufferLine {
                 &mut layout,
                 match_mono_width,
                 hinting,
+                flow,
             );
             self.layout_opt.set_used(layout);
+            self.flow_top = flow_top;
         }
         self.layout_opt.get().expect("layout not found")
+    }
+
+    /// Whether the cached layout flows around a buffer's exclusions: the line
+    /// starts above the lowest one, so the lines below it find their tops
+    /// through its height.
+    pub const fn flows(&self) -> bool {
+        self.flow_top.is_some()
     }
 
     /// Get line layout cache
@@ -355,6 +404,7 @@ impl BufferLine {
             layout_opt: Cached::Empty,
             shaping: Shaping::Advanced,
             metadata: None,
+            flow_top: None,
         }
     }
 
