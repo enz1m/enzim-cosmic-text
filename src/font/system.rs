@@ -494,49 +494,68 @@ impl FontSystem {
             .extend(clusters.map(smol_str::SmolStr::new));
     }
 
-    /// Whether the face's character map holds any of `chars`, read without
-    /// loading the face for shaping. Unreadable faces count as covering.
-    pub(crate) fn face_maps_any(&mut self, id: fontdb::ID, chars: &[char]) -> bool {
-        const COVERAGE_CACHE_LIMIT: usize = 1 << 16;
-        if chars.iter().any(|&c| {
-            !self
-                .face_block_coverage
-                .contains_key(&(id, u32::from(c) >> 7))
-        }) {
-            let mut blocks: Vec<u32> = chars.iter().map(|&c| u32::from(c) >> 7).collect();
-            blocks.sort_unstable();
-            blocks.dedup();
-            let masks = self
-                .db
-                .with_face_data(id, |data, index| {
-                    let charmap = skrifa::FontRef::from_index(data, index).ok()?.charmap();
-                    Some(
-                        blocks
-                            .iter()
-                            .map(|&block| {
-                                (0..128).fold(0u128, |mask, offset| {
-                                    let mapped = char::from_u32(block << 7 | offset)
-                                        .is_some_and(|c| charmap.map(c).is_some());
-                                    mask | u128::from(mapped) << offset
-                                })
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                })
-                .flatten();
-            let Some(masks) = masks else {
-                return true;
-            };
-            if self.face_block_coverage.len() + blocks.len() > COVERAGE_CACHE_LIMIT {
-                self.face_block_coverage.clear();
-            }
-            for (block, mask) in blocks.into_iter().zip(masks) {
-                self.face_block_coverage.insert((id, block), mask);
-            }
+    /// Whether the face can draw any of `chars`, judged from its character
+    /// map without loading the face for shaping. Unreadable faces count as
+    /// covering.
+    pub(crate) fn face_draws_any(&mut self, id: fontdb::ID, chars: &[char]) -> bool {
+        let forms: Vec<Vec<char>> = chars.iter().flat_map(|&c| shaping_forms(c)).collect();
+        let needed: Vec<char> = forms.iter().flatten().copied().collect();
+        if !self.load_block_coverage(id, &needed) {
+            return true;
         }
-        chars.iter().any(|&c| {
-            self.face_block_coverage[&(id, u32::from(c) >> 7)] & (1 << (u32::from(c) & 127)) != 0
-        })
+        forms
+            .iter()
+            .any(|form| form.iter().all(|&c| self.face_maps(id, c)))
+    }
+
+    /// Caches which characters of each block holding `chars` the face maps.
+    /// Returns false when the face's character map cannot be read.
+    fn load_block_coverage(&mut self, id: fontdb::ID, chars: &[char]) -> bool {
+        const COVERAGE_CACHE_LIMIT: usize = 1 << 16;
+        let mut blocks: Vec<u32> = chars
+            .iter()
+            .map(|&c| u32::from(c) >> 7)
+            .filter(|&block| !self.face_block_coverage.contains_key(&(id, block)))
+            .collect();
+        if blocks.is_empty() {
+            return true;
+        }
+        blocks.sort_unstable();
+        blocks.dedup();
+        let masks = self
+            .db
+            .with_face_data(id, |data, index| {
+                let charmap = skrifa::FontRef::from_index(data, index).ok()?.charmap();
+                Some(
+                    blocks
+                        .iter()
+                        .map(|&block| {
+                            (0..128).fold(0u128, |mask, offset| {
+                                let mapped = char::from_u32(block << 7 | offset)
+                                    .is_some_and(|c| charmap.map(c).is_some());
+                                mask | u128::from(mapped) << offset
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten();
+        let Some(masks) = masks else {
+            return false;
+        };
+        if self.face_block_coverage.len() + blocks.len() > COVERAGE_CACHE_LIMIT {
+            self.face_block_coverage.clear();
+        }
+        for (block, mask) in blocks.into_iter().zip(masks) {
+            self.face_block_coverage.insert((id, block), mask);
+        }
+        true
+    }
+
+    fn face_maps(&self, id: fontdb::ID, c: char) -> bool {
+        self.face_block_coverage
+            .get(&(id, u32::from(c) >> 7))
+            .is_some_and(|mask| mask & (1 << (u32::from(c) & 127)) != 0)
     }
 
     /// Consume this [`FontSystem`] and return the locale and database.
@@ -884,6 +903,35 @@ impl FontSystem {
             db.load_font_source(source);
         }
     }
+}
+
+/// Character sequences the shaper can draw for `c`: `c` itself, a canonically
+/// composed prefix of its decomposition followed by the remaining characters,
+/// or the substitute it uses when a face lacks `c`.
+fn shaping_forms(c: char) -> Vec<Vec<char>> {
+    let mut forms = alloc::vec![alloc::vec![c]];
+    let mut parts = Vec::new();
+    unicode_normalization::char::decompose_canonical(c, |part| parts.push(part));
+    let (mut base, mut rest) = (parts[0], &parts[1..]);
+    loop {
+        if base != c {
+            forms.push(core::iter::once(base).chain(rest.iter().copied()).collect());
+        }
+        let Some((&next, tail)) = rest.split_first() else {
+            break;
+        };
+        let Some(composed) = unicode_normalization::char::compose(base, next) else {
+            break;
+        };
+        (base, rest) = (composed, tail);
+    }
+    let substitute = match c {
+        '\u{00A0}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => Some(' '),
+        '\u{2011}' => Some('\u{2010}'),
+        _ => None,
+    };
+    forms.extend(substitute.map(|sub| alloc::vec![sub]));
+    forms
 }
 
 /// A value borrowed together with an [`FontSystem`]
