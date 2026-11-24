@@ -472,6 +472,8 @@ impl FontSystem {
         self.monospace_rankings_cache.clear();
         self.uncovered_clusters.clear();
         self.face_block_coverage.clear();
+        #[cfg(feature = "shape-run-cache")]
+        self.shape_run_cache.clear();
         &mut self.db
     }
 
