@@ -391,9 +391,33 @@ fn shape_run(
         )
     };
 
-    //TODO: improve performance!
+    let cluster_end = |glyphs: &[ShapeGlyph], start: usize| {
+        glyphs[glyph_start..]
+            .iter()
+            .find(|glyph| glyph.start == start)
+            .map_or(end_run, |glyph| glyph.end.max(start))
+    };
     while !missing.is_empty() {
+        let clusters: Vec<&str> = missing
+            .iter()
+            .map(|&start| &line[start..cluster_end(glyphs, start)])
+            .collect();
+        if font_iter.clusters_uncovered(clusters.iter().copied()) {
+            break;
+        }
+        let single_chars: Option<Vec<char>> = clusters
+            .iter()
+            .map(|cluster| {
+                let mut chars = cluster.chars();
+                match (chars.next(), chars.next()) {
+                    (Some(c), None) => Some(c),
+                    _ => None,
+                }
+            })
+            .collect();
+        font_iter.set_missing_chars(single_chars.unwrap_or_default());
         let Some(font) = font_iter.next() else {
+            font_iter.mark_uncovered(clusters.iter().copied());
             break;
         };
 

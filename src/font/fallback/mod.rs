@@ -202,6 +202,9 @@ pub struct FontFallbackIter<'a> {
     mono_matches: Option<Arc<MonoFontMatches>>,
     /// Index of the next candidate in the cached monospace ranking.
     mono_idx: usize,
+    /// Characters still missing; when set, last-resort faces that map none
+    /// of them are skipped without being loaded.
+    missing_chars: Vec<char>,
 }
 
 impl<'a> FontFallbackIter<'a> {
@@ -240,7 +243,23 @@ impl<'a> FontFallbackIter<'a> {
             attrs,
             mono_matches: None,
             mono_idx: 0,
+            missing_chars: Vec::new(),
         }
+    }
+
+    /// Restricts last-resort candidates to faces that map one of `chars`.
+    /// Pass an empty list when a missing cluster holds several characters,
+    /// since shaping may compose them into a character none of them is.
+    pub(crate) fn set_missing_chars(&mut self, chars: Vec<char>) {
+        self.missing_chars = chars;
+    }
+
+    pub(crate) fn clusters_uncovered<'c>(&self, clusters: impl Iterator<Item = &'c str>) -> bool {
+        self.font_system.clusters_uncovered(clusters)
+    }
+
+    pub(crate) fn mark_uncovered<'c>(&mut self, clusters: impl Iterator<Item = &'c str>) {
+        self.font_system.mark_uncovered(clusters);
     }
 
     pub fn check_missing(&self, word: &str) {
@@ -544,6 +563,8 @@ impl<'a> FontFallbackIter<'a> {
             if forbidden_families
                 .iter()
                 .all(|family_name| !self.face_contains_family(id, family_name))
+                && (self.missing_chars.is_empty()
+                    || self.font_system.face_maps_any(id, &self.missing_chars))
             {
                 if let Some(font) = self.font_system.get_font(id, self.ideal_weight) {
                     return Some(font);

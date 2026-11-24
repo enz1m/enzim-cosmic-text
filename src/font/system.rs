@@ -244,6 +244,14 @@ pub struct FontSystem {
     /// Buffer for use in `FontFallbackIter`.
     pub(crate) monospace_fallbacks_buffer: BTreeSet<MonospaceFallbackInfo>,
 
+    /// Clusters that no face in the database draws, learned when a fallback
+    /// walk runs out of faces. Valid until the database changes.
+    uncovered_clusters: BTreeSet<smol_str::SmolStr>,
+
+    /// Which characters of each 128-codepoint block a face maps, for
+    /// last-resort fallback filtering.
+    face_block_coverage: HashMap<(fontdb::ID, u32), u128>,
+
     /// Cache for shaped runs
     #[cfg(feature = "shape-run-cache")]
     pub shape_run_cache: crate::ShapeRunCache,
@@ -266,6 +274,7 @@ impl fmt::Debug for FontSystem {
 
 impl FontSystem {
     const FONT_MATCHES_CACHE_SIZE_LIMIT: usize = 256;
+    const UNCOVERED_CLUSTERS_LIMIT: usize = 1 << 12;
     /// Create a new [`FontSystem`], that allows access to any installed system fonts
     ///
     /// # Timing
@@ -430,6 +439,8 @@ impl FontSystem {
             monospace_rankings_cache: HashMap::default(),
             font_codepoint_support_info_cache: HashMap::default(),
             monospace_fallbacks_buffer: BTreeSet::default(),
+            uncovered_clusters: BTreeSet::default(),
+            face_block_coverage: HashMap::default(),
             #[cfg(feature = "shape-run-cache")]
             shape_run_cache: crate::ShapeRunCache::default(),
             shape_buffer: ShapeBuffer::default(),
@@ -459,7 +470,71 @@ impl FontSystem {
         self.weight_axes = WeightAxes::default();
         self.monospace_font_matches_cache.clear();
         self.monospace_rankings_cache.clear();
+        self.uncovered_clusters.clear();
+        self.face_block_coverage.clear();
         &mut self.db
+    }
+
+    /// Whether every cluster is known to have no face that draws it.
+    pub(crate) fn clusters_uncovered<'c>(
+        &self,
+        mut clusters: impl Iterator<Item = &'c str>,
+    ) -> bool {
+        !self.uncovered_clusters.is_empty()
+            && clusters.all(|cluster| self.uncovered_clusters.contains(cluster))
+    }
+
+    pub(crate) fn mark_uncovered<'c>(&mut self, clusters: impl Iterator<Item = &'c str>) {
+        if self.uncovered_clusters.len() >= Self::UNCOVERED_CLUSTERS_LIMIT {
+            self.uncovered_clusters.clear();
+        }
+        self.uncovered_clusters
+            .extend(clusters.map(smol_str::SmolStr::new));
+    }
+
+    /// Whether the face's character map holds any of `chars`, read without
+    /// loading the face for shaping. Unreadable faces count as covering.
+    pub(crate) fn face_maps_any(&mut self, id: fontdb::ID, chars: &[char]) -> bool {
+        const COVERAGE_CACHE_LIMIT: usize = 1 << 16;
+        if chars.iter().any(|&c| {
+            !self
+                .face_block_coverage
+                .contains_key(&(id, u32::from(c) >> 7))
+        }) {
+            let mut blocks: Vec<u32> = chars.iter().map(|&c| u32::from(c) >> 7).collect();
+            blocks.sort_unstable();
+            blocks.dedup();
+            let masks = self
+                .db
+                .with_face_data(id, |data, index| {
+                    let charmap = skrifa::FontRef::from_index(data, index).ok()?.charmap();
+                    Some(
+                        blocks
+                            .iter()
+                            .map(|&block| {
+                                (0..128).fold(0u128, |mask, offset| {
+                                    let mapped = char::from_u32(block << 7 | offset)
+                                        .is_some_and(|c| charmap.map(c).is_some());
+                                    mask | u128::from(mapped) << offset
+                                })
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .flatten();
+            let Some(masks) = masks else {
+                return true;
+            };
+            if self.face_block_coverage.len() + blocks.len() > COVERAGE_CACHE_LIMIT {
+                self.face_block_coverage.clear();
+            }
+            for (block, mask) in blocks.into_iter().zip(masks) {
+                self.face_block_coverage.insert((id, block), mask);
+            }
+        }
+        chars.iter().any(|&c| {
+            self.face_block_coverage[&(id, u32::from(c) >> 7)] & (1 << (u32::from(c) & 127)) != 0
+        })
     }
 
     /// Consume this [`FontSystem`] and return the locale and database.
