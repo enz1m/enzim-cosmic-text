@@ -27,6 +27,7 @@
 - text: Flow lines around exclusion rectangles
 - font: Preserve the requested family during weight fallback
 - font: Skip fallback faces that cannot draw uncovered text
+- font: Invalidate the font index when font roots or configuration change
 
 The base is the cosmic-text revision already used by enzUI, including its
 existing hecrj changes. Test fonts and images keep upstream Git LFS storage

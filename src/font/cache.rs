@@ -10,9 +10,10 @@
 //! via [`fontdb::Database::push_face_info`] instead of re-parsing every font file. It is a
 //! pure-Rust, dependency-free reimplementation of what fontconfig's `fc-cache` does.
 //!
-//! The cache is keyed on a cheap fingerprint of the font directories and files that were
-//! scanned (per-directory and per-file modification time, plus file size). On any mismatch
-//! the normal scan runs and the cache is rewritten atomically.
+//! The cache is keyed on the font search environment and a cheap fingerprint of the
+//! fontconfig files, every directory under the font roots (taken before the scan, so a
+//! change during the scan invalidates it), and each font file's modification time and
+//! size. On any mismatch the normal scan runs and the cache is rewritten atomically.
 
 use crate::HashMap;
 use alloc::string::String;
@@ -27,7 +28,30 @@ const MAGIC: [u8; 4] = *b"CTFC";
 
 /// Cache format version. Bump whenever the on-disk layout changes so that stale caches
 /// written by an older version are rejected instead of misparsed.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
+
+/// Environment variables that select the fontconfig files and font roots.
+const ENVIRONMENT: [&str; 4] = [
+    "FONTCONFIG_FILE",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "HOME",
+];
+
+const GENERIC_FAMILIES: [fontdb::Family<'static>; 5] = [
+    fontdb::Family::Serif,
+    fontdb::Family::SansSerif,
+    fontdb::Family::Cursive,
+    fontdb::Family::Fantasy,
+    fontdb::Family::Monospace,
+];
+
+type Mtime = (u64, u32);
+
+struct Cached {
+    generic_families: Vec<String>,
+    faces: Vec<FaceInfo>,
+}
 
 /// Loads the system fonts into `db`, using the on-disk cache at `cache_path` when it is
 /// present and still valid.
@@ -37,20 +61,25 @@ const VERSION: u32 = 1;
 /// normal [`Database::load_system_fonts`] scan runs and its result is written back to the
 /// cache for the next start.
 pub(crate) fn load_system_fonts_cached(db: &mut Database, cache_path: &Path) {
-    match try_load(cache_path) {
-        Some(faces) => {
+    let environment = environment();
+    match try_load(cache_path, &environment) {
+        Some(cached) => {
             log::debug!(
                 "Loaded {} font faces from cache '{}'.",
-                faces.len(),
+                cached.faces.len(),
                 cache_path.display()
             );
-            for face in faces {
+            for face in cached.faces {
                 db.push_face_info(face);
+            }
+            for (family, name) in GENERIC_FAMILIES.iter().zip(cached.generic_families) {
+                set_generic_family(db, family, name);
             }
         }
         None => {
+            let watched = font_roots().map(|(config_paths, roots)| watch(config_paths, &roots));
             db.load_system_fonts();
-            if let Err(err) = write(db, cache_path) {
+            if let Err(err) = write(db, cache_path, &environment, watched) {
                 log::warn!(
                     "Failed to write font cache '{}': {err}",
                     cache_path.display()
@@ -106,7 +135,7 @@ fn cache_dir() -> Option<PathBuf> {
 /// Reads `cache_path` and, if it is well-formed and its fingerprint still matches the
 /// filesystem, returns the cached set of faces. Returns `None` on any error, version
 /// mismatch, or fingerprint mismatch.
-fn try_load(cache_path: &Path) -> Option<Vec<FaceInfo>> {
+fn try_load(cache_path: &Path, environment: &[Option<String>]) -> Option<Cached> {
     let bytes = std::fs::read(cache_path).ok()?;
     let mut r = Reader::new(&bytes);
 
@@ -117,15 +146,25 @@ fn try_load(cache_path: &Path) -> Option<Vec<FaceInfo>> {
         return None;
     }
 
-    // Directory fingerprint
-    let dir_count = r.u32()?;
-    for _ in 0..dir_count {
-        let path = r.path()?;
-        let mtime = r.mtime()?;
-        if dir_mtime(&path) != Some(mtime) {
+    for value in environment {
+        if r.optional_string()? != *value {
             return None;
         }
     }
+
+    let watched_count = r.u32()?;
+    for _ in 0..watched_count {
+        let path = r.path()?;
+        let mtime = r.optional_mtime()?;
+        if path_mtime(&path) != mtime {
+            return None;
+        }
+    }
+
+    let generic_families = GENERIC_FAMILIES
+        .iter()
+        .map(|_| r.string())
+        .collect::<Option<Vec<_>>>()?;
 
     // File fingerprint
     let file_count = r.u32()? as usize;
@@ -175,11 +214,19 @@ fn try_load(cache_path: &Path) -> Option<Vec<FaceInfo>> {
         });
     }
 
-    Some(faces)
+    Some(Cached {
+        generic_families,
+        faces,
+    })
 }
 
 /// Serializes the file-backed faces in `db` to `cache_path`, writing atomically
-fn write(db: &Database, cache_path: &Path) -> std::io::Result<()> {
+fn write(
+    db: &Database,
+    cache_path: &Path,
+    environment: &[Option<String>],
+    watched: Option<Vec<(PathBuf, Option<Mtime>)>>,
+) -> std::io::Result<()> {
     let mut file_indices: HashMap<PathBuf, u32> = HashMap::default();
     let mut files: Vec<PathBuf> = Vec::new();
     let mut faces: Vec<(u32, &FaceInfo)> = Vec::new();
@@ -200,25 +247,33 @@ fn write(db: &Database, cache_path: &Path) -> std::io::Result<()> {
         faces.push((index, face));
     }
 
-    // Directories that directly contained a scanned font, deduplicated.
-    let mut dirs: Vec<PathBuf> = Vec::new();
-    let mut seen_dirs: HashSet<PathBuf> = HashSet::default();
-    for path in &files {
-        if let Some(parent) = path.parent() {
-            if seen_dirs.insert(parent.to_path_buf()) {
-                dirs.push(parent.to_path_buf());
-            }
-        }
-    }
+    // Without known font roots, the directories that directly contained a scanned font.
+    let watched = watched.unwrap_or_else(|| {
+        let mut seen_dirs: HashSet<&Path> = HashSet::default();
+        files
+            .iter()
+            .filter_map(|path| path.parent())
+            .filter(|dir| seen_dirs.insert(dir))
+            .map(|dir| (dir.to_path_buf(), path_mtime(dir)))
+            .collect()
+    });
 
     let mut w = Writer::new();
     w.bytes(&MAGIC);
     w.u32(VERSION);
 
-    w.u32(dirs.len() as u32);
-    for dir in &dirs {
-        w.path(dir);
-        w.mtime(dir_mtime(dir).unwrap_or((0, 0)));
+    for value in environment {
+        w.optional_string(value.as_deref());
+    }
+
+    w.u32(watched.len() as u32);
+    for (path, mtime) in &watched {
+        w.path(path);
+        w.optional_mtime(*mtime);
+    }
+
+    for family in &GENERIC_FAMILIES {
+        w.string(db.family_name(family));
     }
 
     w.u32(files.len() as u32);
@@ -268,13 +323,151 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     }
 }
 
-/// Returns the modification time of a directory as `(secs, nanos)` since the Unix epoch.
-fn dir_mtime(path: &Path) -> Option<(u64, u32)> {
-    let metadata = std::fs::metadata(path).ok()?;
-    if !metadata.is_dir() {
-        return None;
+fn path_mtime(path: &Path) -> Option<Mtime> {
+    mtime_parts(std::fs::metadata(path).ok()?.modified().ok()?)
+}
+
+fn environment() -> Vec<Option<String>> {
+    ENVIRONMENT
+        .iter()
+        .map(|name| std::env::var(name).ok())
+        .collect()
+}
+
+fn set_generic_family(db: &mut Database, family: &fontdb::Family<'_>, name: String) {
+    match family {
+        fontdb::Family::Serif => db.set_serif_family(name),
+        fontdb::Family::SansSerif => db.set_sans_serif_family(name),
+        fontdb::Family::Cursive => db.set_cursive_family(name),
+        fontdb::Family::Fantasy => db.set_fantasy_family(name),
+        fontdb::Family::Monospace => db.set_monospace_family(name),
+        fontdb::Family::Name(_) => {}
     }
-    mtime_parts(metadata.modified().ok()?)
+}
+
+/// Fingerprints the configuration files, each font root, and every directory below it.
+/// Missing paths are recorded too, so that creating one invalidates the cache.
+fn watch(config_paths: Vec<PathBuf>, roots: &[PathBuf]) -> Vec<(PathBuf, Option<Mtime>)> {
+    let mut watched: Vec<_> = config_paths
+        .into_iter()
+        .map(|path| {
+            let mtime = path_mtime(&path);
+            (path, mtime)
+        })
+        .collect();
+    let mut seen = HashSet::new();
+    for root in roots {
+        watch_dir(root.clone(), &mut seen, &mut watched);
+    }
+    watched
+}
+
+fn watch_dir(
+    dir: PathBuf,
+    seen: &mut HashSet<PathBuf>,
+    watched: &mut Vec<(PathBuf, Option<Mtime>)>,
+) {
+    let mtime = path_mtime(&dir);
+    let entries = std::fs::read_dir(&dir);
+    watched.push((dir, mtime));
+    for entry in entries.into_iter().flatten().flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let path = entry.path();
+        let is_dir = file_type.is_dir()
+            || (file_type.is_symlink() && std::fs::metadata(&path).is_ok_and(|m| m.is_dir()));
+        if is_dir {
+            let path = std::fs::canonicalize(&path).unwrap_or(path);
+            if seen.insert(path.clone()) {
+                watch_dir(path, seen, watched);
+            }
+        }
+    }
+}
+
+/// The configuration files and font roots that [`Database::load_system_fonts`] reads, where
+/// they are known.
+#[cfg(all(
+    unix,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+))]
+fn font_roots() -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+
+    #[cfg(feature = "fontconfig")]
+    let (config_paths, roots) = fontconfig_roots(home.as_deref());
+    #[cfg(not(feature = "fontconfig"))]
+    let (config_paths, roots) = (Vec::new(), Vec::new());
+
+    if !roots.is_empty() {
+        return Some((config_paths, roots));
+    }
+    let mut roots = vec![
+        PathBuf::from("/usr/share/fonts/"),
+        PathBuf::from("/usr/local/share/fonts/"),
+    ];
+    if let Some(home) = home {
+        roots.push(home.join(".fonts"));
+        roots.push(home.join(".local/share/fonts"));
+    }
+    Some((config_paths, roots))
+}
+
+#[cfg(not(all(
+    unix,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+)))]
+fn font_roots() -> Option<(Vec<PathBuf>, Vec<PathBuf>)> {
+    None
+}
+
+/// Mirrors fontdb's fontconfig lookup. No roots means fontdb scans its fixed directories.
+#[cfg(all(
+    feature = "fontconfig",
+    unix,
+    not(any(target_os = "macos", target_os = "ios", target_os = "android"))
+))]
+fn fontconfig_roots(home: Option<&Path>) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut config = fontconfig_parser::FontConfig::default();
+    let mut config_paths = Vec::new();
+
+    if let Some(file) = std::env::var_os("FONTCONFIG_FILE") {
+        config_paths.push(PathBuf::from(&file));
+        let _ = config.merge_config(Path::new(&file));
+    } else {
+        let config_home = std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.map(|home| home.join(".config")));
+        let read_global = match config_home {
+            Some(config_home) => {
+                let user = config_home.join("fontconfig/fonts.conf");
+                config_paths.push(config_home.join("fontconfig/conf.d"));
+                config_paths.push(user.clone());
+                config.merge_config(&user).is_err()
+            }
+            None => true,
+        };
+        if read_global {
+            config_paths.push(PathBuf::from("/etc/fonts/local.conf"));
+            let _ = config.merge_config(Path::new("/etc/fonts/local.conf"));
+        }
+        config_paths.push(PathBuf::from("/etc/fonts/fonts.conf"));
+        let _ = config.merge_config(Path::new("/etc/fonts/fonts.conf"));
+    }
+    // Package-installed configuration is linked into the conventional include directory.
+    config_paths.push(PathBuf::from("/etc/fonts/conf.d"));
+    config_paths.extend(config.config_files);
+
+    let roots = config
+        .dirs
+        .into_iter()
+        .filter_map(|dir| match dir.path.strip_prefix("~") {
+            Ok(relative) => home.map(|home| home.join(relative)),
+            Err(_) => Some(dir.path),
+        })
+        .collect();
+    (config_paths, roots)
 }
 
 /// Returns `((secs, nanos), len)` for a regular file, or `None` if it is missing or not a file.
@@ -371,6 +564,20 @@ impl Writer {
     fn path(&mut self, path: &Path) {
         self.string(&path.to_string_lossy());
     }
+
+    fn optional_string(&mut self, value: Option<&str>) {
+        self.u8(u8::from(value.is_some()));
+        if let Some(value) = value {
+            self.string(value);
+        }
+    }
+
+    fn optional_mtime(&mut self, value: Option<Mtime>) {
+        self.u8(u8::from(value.is_some()));
+        if let Some(value) = value {
+            self.mtime(value);
+        }
+    }
 }
 
 /// Bounds-checked little-endian byte reader. Every accessor returns `None` on truncation
@@ -420,5 +627,21 @@ impl<'a> Reader<'a> {
 
     fn path(&mut self) -> Option<PathBuf> {
         Some(PathBuf::from(self.string()?))
+    }
+
+    fn optional_string(&mut self) -> Option<Option<String>> {
+        match self.u8()? {
+            0 => Some(None),
+            1 => Some(Some(self.string()?)),
+            _ => None,
+        }
+    }
+
+    fn optional_mtime(&mut self) -> Option<Option<Mtime>> {
+        match self.u8()? {
+            0 => Some(None),
+            1 => Some(Some(self.mtime()?)),
+            _ => None,
+        }
     }
 }
