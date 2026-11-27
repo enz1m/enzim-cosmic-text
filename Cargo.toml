@@ -54,7 +54,7 @@ default = ["std", "swash", "fontconfig"]
 fontconfig = ["fontdb/fontconfig", "std", "dep:libloading", "dep:fontconfig-parser"]
 monospace_fallback = []
 no_std = [
-    "hashbrown",
+    "dep:hashbrown",
     "dep:libm",
     "core_maths",
     "harfrust/libm",
@@ -62,7 +62,7 @@ no_std = [
     "swash?/libm",
 ]
 peniko = []
-shape-run-cache = []
+shape-run-cache = ["dep:hashbrown"]
 std = [
     "fontdb/memmap",
     "fontdb/std",

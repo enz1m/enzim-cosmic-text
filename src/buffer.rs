@@ -220,7 +220,6 @@ pub struct LayoutRunIter<'b> {
     scroll: f32,
     line_i: usize,
     layout_i: usize,
-    total_height: f32,
     line_top: f32,
 }
 
@@ -249,7 +248,6 @@ impl<'b> LayoutRunIter<'b> {
             scroll,
             line_i: start,
             layout_i: 0,
-            total_height: 0.0,
             line_top: 0.0,
         }
     }
@@ -266,7 +264,6 @@ impl<'b> Iterator for LayoutRunIter<'b> {
                 self.layout_i += 1;
 
                 let full_height = layout_line.line_height(self.line_height);
-                self.total_height += full_height;
 
                 // A row that skipped space to get below an exclusion starts
                 // that far down, and its content is centred in what is left.
@@ -629,8 +626,13 @@ impl Buffer {
 
         self.shape_until_scroll(font_system, prune);
 
-        // Adjust horizontal scroll to include cursor
-        if let Some(layout_cursor) = self.layout_cursor(font_system, cursor) {
+        // Pruning or a flow change can invalidate the caret's layout.
+        let layout_cursor = if prune || !self.exclusions.is_empty() {
+            self.layout_cursor(font_system, cursor)
+        } else {
+            Some(layout_cursor)
+        };
+        if let Some(layout_cursor) = layout_cursor {
             if let Some(layout_lines) = self.line_layout(font_system, layout_cursor.line) {
                 if let Some(layout_line) = layout_lines.get(layout_cursor.layout) {
                     let (x_min, x_max) = layout_line
@@ -773,23 +775,21 @@ impl Buffer {
         cursor: Cursor,
     ) -> Option<LayoutCursor> {
         let layout = self.line_layout(font_system, cursor.line)?;
+        let before = cursor.affinity == Affinity::Before;
         for (layout_i, layout_line) in layout.iter().enumerate() {
-            for (glyph_i, glyph) in layout_line.glyphs.iter().enumerate() {
-                let cursor_end =
-                    Cursor::new_with_affinity(cursor.line, glyph.end, Affinity::Before);
-                let cursor_start =
-                    Cursor::new_with_affinity(cursor.line, glyph.start, Affinity::After);
-                let (cursor_left, cursor_right) = if glyph.level.is_ltr() {
-                    (cursor_start, cursor_end)
-                } else {
-                    (cursor_end, cursor_start)
-                };
-                if cursor == cursor_left {
-                    return Some(LayoutCursor::new(cursor.line, layout_i, glyph_i));
-                }
-                if cursor == cursor_right {
-                    return Some(LayoutCursor::new(cursor.line, layout_i, glyph_i + 1));
-                }
+            let glyphs = &layout_line.glyphs;
+            let glyph_i = if before {
+                glyphs.iter().position(|glyph| cursor.index == glyph.end)
+            } else {
+                glyphs.iter().position(|glyph| cursor.index == glyph.start)
+            };
+            if let Some(glyph_i) = glyph_i {
+                let after_glyph = before == glyphs[glyph_i].level.is_ltr();
+                return Some(LayoutCursor::new(
+                    cursor.line,
+                    layout_i,
+                    glyph_i + usize::from(after_glyph),
+                ));
             }
         }
 

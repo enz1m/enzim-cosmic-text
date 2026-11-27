@@ -177,11 +177,11 @@ fn shape_fallback(
     let rtl = matches!(buffer.direction(), harfrust::Direction::RightToLeft);
     assert_eq!(rtl, span_rtl);
 
-    let attrs = attrs_list.get_span(start_run);
+    let run_attrs = attrs_list.get_span(start_run);
     let mut rb_font_features = Vec::new();
 
     // Convert attrs::Feature to harfrust::Feature
-    for feature in &attrs.font_features.features {
+    for feature in &run_attrs.font_features.features {
         rb_font_features.push(harfrust::Feature::new(
             harfrust::Tag::new(feature.tag.as_bytes()),
             feature.value,
@@ -233,6 +233,7 @@ fn shape_fallback(
     let mut missing = Vec::new();
     glyphs.reserve(glyph_infos.len());
     let glyph_start = glyphs.len();
+    let has_spans = !attrs_list.spans.is_empty();
     for (info, pos) in glyph_infos.iter().zip(glyph_positions.iter()) {
         let start_glyph = start_run + info.cluster as usize;
 
@@ -240,7 +241,13 @@ fn shape_fallback(
             missing.push(start_glyph);
         }
 
-        let attrs = attrs_list.get_span(start_glyph);
+        let span_attrs;
+        let attrs = if has_spans {
+            span_attrs = attrs_list.get_span(start_glyph);
+            &span_attrs
+        } else {
+            &run_attrs
+        };
         let x_advance = pos.x_advance as f32 / font_scale
             + attrs.letter_spacing_opt.map_or(0.0, |spacing| spacing.0);
         let y_advance = pos.y_advance as f32 / font_scale;
@@ -263,7 +270,7 @@ fn shape_fallback(
             //TODO: color should not be related to shaping
             color_opt: attrs.color_opt,
             metadata: attrs.metadata,
-            cache_key_flags: override_fake_italic(attrs.cache_key_flags, font, &attrs),
+            cache_key_flags: override_fake_italic(attrs.cache_key_flags, font, attrs),
             metrics_opt: attrs.metrics_opt.map(Into::into),
         });
     }
@@ -515,12 +522,33 @@ fn shape_run_cached(
     end_run: usize,
     span_rtl: bool,
 ) {
-    use crate::{AttrsOwned, ShapeRunKey};
+    use crate::ShapeRunKey;
+    #[cfg(not(feature = "std"))]
+    use alloc::string::ToString;
 
     let run_range = start_run..end_run;
+    let text = &line[run_range.clone()];
+    let append = |glyphs: &mut Vec<ShapeGlyph>, cached: &[ShapeGlyph]| {
+        glyphs.extend(cached.iter().cloned().map(|mut glyph| {
+            glyph.start += start_run;
+            glyph.end += start_run;
+            glyph
+        }));
+    };
+    let plain = attrs_list.spans.is_empty();
+    if plain {
+        if let Some(cached) =
+            font_system
+                .shape_run_cache
+                .get_plain(text, attrs_list.defaults_owned(), span_rtl)
+        {
+            append(glyphs, cached);
+            return;
+        }
+    }
     let mut key = ShapeRunKey {
-        text: line[run_range.clone()].to_string(),
-        default_attrs: AttrsOwned::new(&attrs_list.defaults()),
+        text: text.to_string(),
+        default_attrs: attrs_list.defaults_owned().clone(),
         attrs_spans: Vec::new(),
         rtl: span_rtl,
     };
@@ -536,20 +564,16 @@ fn shape_run_cached(
             key.attrs_spans.push((range, attrs.clone()));
         }
     }
-    if let Some(cache_glyphs) = font_system.shape_run_cache.get(&key) {
-        for mut glyph in cache_glyphs.iter().cloned() {
-            // Adjust glyph start and end to match run position
-            glyph.start += start_run;
-            glyph.end += start_run;
-            glyphs.push(glyph);
+    if !plain {
+        if let Some(cached) = font_system.shape_run_cache.get(&key) {
+            append(glyphs, cached);
+            return;
         }
-        return;
     }
 
-    // Fill in cache if not already set
-    let mut cache_glyphs = Vec::new();
+    let glyph_start = glyphs.len();
     shape_run(
-        &mut cache_glyphs,
+        glyphs,
         font_system,
         line,
         attrs_list,
@@ -557,13 +581,16 @@ fn shape_run_cached(
         end_run,
         span_rtl,
     );
-    glyphs.extend_from_slice(&cache_glyphs);
-    for glyph in cache_glyphs.iter_mut() {
-        // Adjust glyph start and end to remove run position
-        glyph.start -= start_run;
-        glyph.end -= start_run;
-    }
-    font_system.shape_run_cache.insert(key, cache_glyphs);
+    let cached = glyphs[glyph_start..]
+        .iter()
+        .cloned()
+        .map(|mut glyph| {
+            glyph.start -= start_run;
+            glyph.end -= start_run;
+            glyph
+        })
+        .collect();
+    font_system.shape_run_cache.insert(key, cached);
 }
 
 #[cfg(feature = "swash")]
@@ -920,19 +947,21 @@ impl ShapeWord {
 
         let span_rtl = level.is_rtl();
 
-        // Fast path optimization: For simple ASCII words, skip expensive grapheme iteration
-        let is_simple_ascii =
-            word.is_ascii() && !word.chars().any(|c| c.is_ascii_control() && c != '\t');
+        let is_simple_ascii = word.is_ascii()
+            && !word
+                .bytes()
+                .any(|byte| byte.is_ascii_control() && byte != b'\t');
 
-        if is_simple_ascii && !word.is_empty() && {
-            let attrs_start = attrs_list.get_span(word_range.start);
-            // Only spans overlapping the word range can split its shaping run,
-            // so check those instead of every span in the line.
-            attrs_list
-                .spans
-                .overlapping(&word_range)
-                .all(|(_, other_attrs)| attrs_start.compatible(&other_attrs.as_attrs()))
-        } {
+        if is_simple_ascii
+            && !word.is_empty()
+            && (attrs_list.spans.is_empty() || {
+                let attrs_start = attrs_list.get_span(word_range.start);
+                attrs_list
+                    .spans
+                    .overlapping(&word_range)
+                    .all(|(_, other_attrs)| attrs_start.compatible(&other_attrs.as_attrs()))
+            })
+        {
             shaping.run(
                 &mut glyphs,
                 font_system,
@@ -1672,105 +1701,91 @@ impl ShapeLine {
         cached_spans.clear();
         cached_spans.extend(spans.drain(..).rev());
 
-        // Pure ASCII text cannot contain strong RTL characters, paragraph
-        // separators, or BiDi controls, so with an LTR paragraph base it is
-        // always a single LTR paragraph at level 0. Construct the BidiInfo
-        // directly to skip the per-character BiDi analysis.
-        let ascii_fast_path =
-            line.is_ascii() && matches!(direction, Direction::Auto | Direction::LeftToRight);
-        let bidi = if ascii_fast_path {
-            let mut paragraphs = Vec::new();
+        let rtl = if line.is_ascii()
+            && matches!(direction, Direction::Auto | Direction::LeftToRight)
+        {
             if !line.is_empty() {
-                paragraphs.push(unicode_bidi::ParagraphInfo {
-                    range: 0..line.len(),
-                    level: unicode_bidi::Level::ltr(),
+                let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
+                span.build(
+                    font_system,
+                    line,
+                    attrs_list,
+                    0..line.len(),
+                    false,
+                    unicode_bidi::Level::ltr(),
+                    shaping,
+                );
+                spans.push(span);
+            }
+            false
+        } else {
+            let bidi = unicode_bidi::BidiInfo::new(line, direction.bidi_level());
+            let rtl = bidi
+                .paragraphs
+                .first()
+                .map_or(direction == Direction::RightToLeft, |paragraph| {
+                    paragraph.level.is_rtl()
                 });
-            }
-            // `original_classes` is only read by `adjust_levels`, which the
-            // fast path skips below, so leave it empty.
-            unicode_bidi::BidiInfo {
-                text: line,
-                original_classes: Vec::new(),
-                levels: vec![unicode_bidi::Level::ltr(); line.len()],
-                paragraphs,
-            }
-        } else {
-            unicode_bidi::BidiInfo::new(line, direction.bidi_level())
-        };
-        let rtl = if bidi.paragraphs.is_empty() {
-            // No strong content to detect from, go with default base direction if it's set
-            direction == Direction::RightToLeft
-        } else {
-            bidi.paragraphs[0].level.is_rtl()
-        };
+            for para_info in &bidi.paragraphs {
+                let line_range = para_info.range.clone();
+                let levels = Self::adjust_levels(&unicode_bidi::Paragraph::new(&bidi, para_info));
 
-        log::trace!("Line {}: '{}'", if rtl { "RTL" } else { "LTR" }, line);
+                // Find consecutive level runs. We use this to create Spans.
+                // Each span is a set of characters with equal levels.
+                let mut start = line_range.start;
+                let mut run_level = levels[start];
 
-        for para_info in &bidi.paragraphs {
-            let line_range = para_info.range.clone();
-            // `adjust_levels` is a no-op for the pure-ASCII fast path (no
-            // B/S classes to reset and the paragraph level is already 0), so
-            // use the levels as-is and avoid its per-char scan and clone.
-            let levels = if ascii_fast_path {
-                bidi.levels.clone()
-            } else {
-                Self::adjust_levels(&unicode_bidi::Paragraph::new(&bidi, para_info))
-            };
-
-            // Find consecutive level runs. We use this to create Spans.
-            // Each span is a set of characters with equal levels.
-            let mut start = line_range.start;
-            let mut run_level = levels[start];
-            spans.reserve(line_range.end - start + 1);
-
-            for (i, &new_level) in levels
-                .iter()
-                .enumerate()
-                .take(line_range.end)
-                .skip(start + 1)
-            {
-                if new_level != run_level {
-                    // End of the previous run, start of a new one.
-                    let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
-                    span.build(
-                        font_system,
-                        line,
-                        attrs_list,
-                        start..i,
-                        rtl,
-                        run_level,
-                        shaping,
-                    );
-                    spans.push(span);
-                    start = i;
-                    run_level = new_level;
-                }
-            }
-            let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
-            span.build(
-                font_system,
-                line,
-                attrs_list,
-                start..line_range.end,
-                rtl,
-                run_level,
-                shaping,
-            );
-            spans.push(span);
-        }
-
-        // Adjust for tabs
-        let mut x = 0.0;
-        for span in &mut spans {
-            for word in &mut span.words {
-                for glyph in &mut word.glyphs {
-                    if line.get(glyph.start..glyph.end) == Some("\t") {
-                        // Tabs are shaped as spaces, so they will always have the x_advance of a space.
-                        let tab_x_advance = f32::from(tab_width) * glyph.x_advance;
-                        let tab_stop = (math::floorf(x / tab_x_advance) + 1.0) * tab_x_advance;
-                        glyph.x_advance = tab_stop - x;
+                for (i, &new_level) in levels
+                    .iter()
+                    .enumerate()
+                    .take(line_range.end)
+                    .skip(start + 1)
+                {
+                    if new_level != run_level {
+                        // End of the previous run, start of a new one.
+                        let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
+                        span.build(
+                            font_system,
+                            line,
+                            attrs_list,
+                            start..i,
+                            rtl,
+                            run_level,
+                            shaping,
+                        );
+                        spans.push(span);
+                        start = i;
+                        run_level = new_level;
                     }
-                    x += glyph.x_advance;
+                }
+                let mut span = cached_spans.pop().unwrap_or_else(ShapeSpan::empty);
+                span.build(
+                    font_system,
+                    line,
+                    attrs_list,
+                    start..line_range.end,
+                    rtl,
+                    run_level,
+                    shaping,
+                );
+                spans.push(span);
+            }
+            rtl
+        };
+
+        if line.as_bytes().contains(&b'\t') {
+            let mut x = 0.0;
+            for span in &mut spans {
+                for word in &mut span.words {
+                    for glyph in &mut word.glyphs {
+                        if line.get(glyph.start..glyph.end) == Some("\t") {
+                            // The tab was shaped as a space.
+                            let tab_x_advance = f32::from(tab_width) * glyph.x_advance;
+                            let tab_stop = (math::floorf(x / tab_x_advance) + 1.0) * tab_x_advance;
+                            glyph.x_advance = tab_stop - x;
+                        }
+                        x += glyph.x_advance;
+                    }
                 }
             }
         }
@@ -3244,8 +3259,6 @@ impl ShapeLine {
                 continue;
             }
 
-            let new_order = self.reorder(&visual_line.ranges);
-
             let mut glyphs = cached_glyph_sets
                 .pop()
                 .unwrap_or_else(|| Vec::with_capacity(1));
@@ -3412,14 +3425,11 @@ impl ShapeLine {
                                 _ => font_size,
                             };
 
-                            let mut x_advance = glyph_font_size.mul_add(
-                                glyph.x_advance,
-                                if word.blank {
-                                    justification_expansion
-                                } else {
-                                    0.0
-                                },
-                            );
+                            let mut x_advance = if word.blank && justification_expansion != 0.0 {
+                                glyph_font_size.mul_add(glyph.x_advance, justification_expansion)
+                            } else {
+                                glyph_font_size * glyph.x_advance
+                            };
                             if let Some(match_em_width) = match_mono_em_width {
                                 // Round to nearest monospace width
                                 x_advance = ((x_advance / match_em_width).round()) * match_em_width;
@@ -3461,42 +3471,35 @@ impl ShapeLine {
                             }
                             glyphs.push(layout_glyph);
 
-                            if deco_cursor >= deco_spans.len()
-                                || glyph.start < deco_spans[deco_cursor].0.start
-                            {
-                                deco_cursor = 0;
-                            }
-                            while deco_cursor < deco_spans.len()
-                                && deco_spans[deco_cursor].0.end <= glyph.start
-                            {
-                                deco_cursor += 1;
-                            }
-                            let glyph_deco = deco_spans
-                                .get(deco_cursor)
-                                .filter(|(range, _)| glyph.start >= range.start);
-                            let glyph_idx = glyphs.len() - 1;
-                            // A span covers CONSECUTIVE glyphs, so the open
-                            // span may only grow when it ends at this glyph.
-                            // Matching on the decoration data alone reopened a
-                            // span across undecorated glyphs, which underlined
-                            // the space between two separately underlined
-                            // words.
-                            let extends = matches!(
-                                (decorations.last(), &glyph_deco),
-                                (Some(span), Some((_, d)))
-                                    if span.data == *d && span.glyph_range.end == glyph_idx
-                            );
-                            if extends {
-                                if let Some(last) = decorations.last_mut() {
-                                    last.glyph_range.end = glyph_idx + 1;
+                            if !deco_spans.is_empty() {
+                                if deco_cursor >= deco_spans.len()
+                                    || glyph.start < deco_spans[deco_cursor].0.start
+                                {
+                                    deco_cursor = 0;
                                 }
-                            } else if let Some((_, d)) = glyph_deco {
-                                decorations.push(DecorationSpan {
-                                    glyph_range: glyph_idx..glyph_idx + 1,
-                                    data: d.clone(),
-                                    color_opt: glyphs[glyph_idx].color_opt,
-                                    font_size: glyphs[glyph_idx].font_size,
-                                });
+                                while deco_cursor < deco_spans.len()
+                                    && deco_spans[deco_cursor].0.end <= glyph.start
+                                {
+                                    deco_cursor += 1;
+                                }
+                                if let Some((_, data)) = deco_spans
+                                    .get(deco_cursor)
+                                    .filter(|(range, _)| glyph.start >= range.start)
+                                {
+                                    let glyph_idx = glyphs.len() - 1;
+                                    if let Some(span) = decorations.last_mut().filter(|span| {
+                                        span.data == *data && span.glyph_range.end == glyph_idx
+                                    }) {
+                                        span.glyph_range.end = glyph_idx + 1;
+                                    } else {
+                                        decorations.push(DecorationSpan {
+                                            glyph_range: glyph_idx..glyph_idx + 1,
+                                            data: data.clone(),
+                                            color_opt: glyphs[glyph_idx].color_opt,
+                                            font_size: glyphs[glyph_idx].font_size,
+                                        });
+                                    }
+                                }
                             }
                             if !self.rtl {
                                 *x += x_advance;
@@ -3525,8 +3528,18 @@ impl ShapeLine {
                 }
             };
 
-            if self.rtl {
-                for range in new_order.into_iter().rev() {
+            if visual_line.ranges.len() == 1 {
+                process_range(
+                    0..1,
+                    &mut x,
+                    &mut y,
+                    &mut glyphs,
+                    &mut decorations,
+                    &mut max_ascent,
+                    &mut max_descent,
+                );
+            } else if self.rtl {
+                for range in self.reorder(&visual_line.ranges).into_iter().rev() {
                     process_range(
                         range,
                         &mut x,
@@ -3538,8 +3551,7 @@ impl ShapeLine {
                     );
                 }
             } else {
-                /* LTR */
-                for range in new_order {
+                for range in self.reorder(&visual_line.ranges) {
                     process_range(
                         range,
                         &mut x,

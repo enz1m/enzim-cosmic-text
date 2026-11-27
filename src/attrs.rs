@@ -600,6 +600,11 @@ impl AttrsList {
         self.defaults.as_attrs()
     }
 
+    #[cfg(feature = "shape-run-cache")]
+    pub(crate) const fn defaults_owned(&self) -> &AttrsOwned {
+        &self.defaults
+    }
+
     /// Get the current attribute spans
     pub fn spans(&self) -> Vec<(&Range<usize>, &AttrsOwned)> {
         self.spans_iter().collect()
